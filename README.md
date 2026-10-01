@@ -177,3 +177,71 @@ Cứu máy: giữ **Vol− + FF** khi bật nguồn để vào fastboot, flash l
 - Kernel GPL của Sony: [oss.sony.net – NW‑A105_Ver20211130](https://oss.sony.net/Products/Linux/Audio/NW-A105_Ver20211130.html)
 - Tool flash của NXP: [nxp-imx/mfgtools (uuu)](https://github.com/nxp-imx/mfgtools)
 - Help Guide chính thức: [helpguide.sony.net – NW‑A100 series](https://helpguide.sony.net/dmp/nwa100/v1/en/index.html)
+
+---
+
+## 7. Chạy AI nhỏ và dùng làm "bộ xử lý chuyên biệt"
+
+### Giới hạn phần cứng cần biết trước
+
+| Yếu tố | Thực tế trên NW‑A105 | Hệ quả |
+|---|---|---|
+| CPU | 4× Cortex‑A53 @ 1.8 GHz, ARMv8.0, có NEON nhưng **không có lệnh dot‑product (SDOT) / i8mm** | Suy luận int8/int4 chậm hơn nhiều so với A55/A76 cùng xung; tương đương Raspberry Pi 3B+ nhanh hơn ~30 % |
+| GPU | GC NanoUltra: chỉ OpenGL ES 2.0 / OpenVG. **Không OpenCL, không Vulkan compute** | Mọi mô hình chạy thuần CPU. Các app dùng GPU (MLC Chat, llama.cpp Vulkan) không dùng được |
+| NPU | **Không có** (chỉ i.MX 8M Plus mới có NPU) | |
+| RAM | 4 GB, Android chiếm ~1.5 GB | Mô hình tối đa thực tế ~2 GB file → LLM ≤ 3B ở Q4 |
+| Băng thông RAM | LPDDR4 bus 32‑bit, thấp hơn điện thoại cùng thời | Tốc độ sinh token bị giới hạn bởi băng thông, không phải số nhân |
+| Coprocessor | Cortex‑M4F @ 400 MHz trong SoC | Lõi real‑time, Sony không mở cho người dùng; cần kernel/remoteproc riêng (cấp 3) |
+| VPU | Giải mã H.264/H.265 1080p60, mã hoá H.264 1080p | Phát video mượt, nhưng không dùng cho AI |
+| Không có mic / camera | | Không làm trợ lý giọng nói, không nhận diện ảnh trực tiếp |
+
+### LLM: chạy được, nhưng chậm
+
+Ước lượng từ kết quả llama.cpp trên Raspberry Pi 3/4 (cùng lớp A53/A72), **chưa đo trên máy thật**:
+
+| Mô hình (Q4_K_M) | Kích thước | Sinh token | Nạp prompt | Dùng được cho |
+|---|---|---|---|---|
+| Qwen2.5‑0.5B, SmolLM2‑360M | 0.4 GB | ~5–8 tok/s | ~15–25 tok/s | Chat ngắn, tóm tắt vài câu, sửa chính tả |
+| Llama 3.2 1B, Qwen2.5 1.5B, SmolLM2‑1.7B | 0.8–1.1 GB | ~2–4 tok/s | ~6–12 tok/s | Chat chậm, trả lời câu hỏi đơn giản |
+| Qwen2.5 3B, Llama 3.2 3B, Phi‑3‑mini | ~2 GB | ~1 tok/s | ~2–4 tok/s | Chỉ để thử, prompt 500 token mất vài phút |
+
+Cách chạy: Termux → `pkg install cmake clang git` → build `llama.cpp` (bật `-DGGML_NATIVE=ON`) → `llama-server` chạy nền, dùng giao diện web qua Wi‑Fi từ điện thoại/PC.
+App có sẵn: PocketPal AI, ChatterUI (đều dùng llama.cpp CPU, cần kiểm tra có hỗ trợ Android 9 không).
+
+Kết luận: LLM trên máy này là **trò chơi học tập**, không phải công cụ. Nếu cần LLM thật, để máy làm **client**: Termux hoặc app chat gọi tới PC/API qua Wi‑Fi.
+
+### AI nhỏ chạy tốt và hợp với bản chất "máy nghe nhạc"
+
+| # | Project | Mô hình | Vì sao hợp |
+|---|---|---|---|
+| 7.1 | **Máy đọc sách / báo bằng giọng nói offline** | Piper TTS (VITS) qua sherpa‑onnx, ~20–60 MB/giọng, có tiếng Việt | Piper chạy real‑time thoải mái trên A53. Đầu ra đi qua S‑Master HX → giọng đọc nghe hay hơn mọi điện thoại. Cài sherpa‑onnx TTS engine APK làm TTS hệ thống → app đọc EPUB/RSS (Moon+ Reader, @Voice) dùng được ngay |
+| 7.2 | **Trạm chép lời podcast / ghi âm** | whisper.cpp `tiny` / `base`, hoặc Vosk | Không có mic nên chỉ chép từ file. `tiny` chậm hơn real‑time ~2–4 lần trên A53: 1 giờ podcast mất 2–4 giờ chạy nền khi cắm sạc. Vosk nhẹ hơn, gần real‑time |
+| 7.3 | **Gắn tag / phân loại nhạc tự động** | Essentia‑TensorFlow (MusiCNN, mood, genre), chromaprint + AcoustID | Chạy một lần qua thư viện offline, sinh playlist theo mood/genre. Nặng vừa phải, chạy nền qua đêm |
+| 7.4 | **Tìm kiếm ngữ nghĩa lời bài hát / ghi chú** | all‑MiniLM‑L6‑v2 (22M tham số) qua ONNX Runtime | Embedding 1 câu mất vài chục ms; đủ để tìm "bài nào nói về mưa" trong thư viện lyrics |
+| 7.5 | **Nhận diện bài hát offline** | Fingerprint (chromaprint / dejavu) | Không cần mạng, nhưng chỉ nhận trong thư viện của bạn vì không có mic → phải đưa file vào |
+| 7.6 | **Tách stem / upscale nhạc bằng AI** | Demucs, Spleeter | **Không khuyến nghị**: trên A53 mất hàng giờ cho một bài và dễ hết RAM. Làm trên PC rồi đồng bộ sang máy |
+
+### Dùng làm bộ xử lý chuyên biệt (không nhất thiết AI)
+
+| # | Vai trò | Cách dựng | Ghi chú |
+|---|---|---|---|
+| 7.7 | **Endpoint multiroom audio (Snapcast / Squeezelite / Roon Bridge‑lite)** | Termux: `pkg install pulseaudio` (sink OpenSL ES) → chạy `snapclient` hoặc `squeezelite -o pulse` | Walkman thành một "loa" trong hệ thống nhiều phòng, âm qua S‑Master HX ra ampli. Rất hợp với mục 0.2 |
+| 7.8 | **Máy chủ TTS cho Home Assistant (Wyoming‑Piper)** | proot Debian → `pip install wyoming-piper` → HA trỏ tới IP Walkman | Walkman gánh phần sinh giọng nói cho cả nhà; HA gửi text, nhận WAV. Không cần mic trên Walkman |
+| 7.9 | **DNS lọc quảng cáo cho cả nhà (AdGuard Home)** | Cần root để bind cổng 53, hoặc không root + router chuyển cổng 53 → 5353 | Chạy 24/7 cắm sạc, tải nhẹ, 4 GB RAM dư |
+| 7.10 | **Node Syncthing / backup nhỏ** | Syncthing‑Fork, bộ nhớ trong ~5 GB | Node trung gian luôn bật để ảnh/ghi chú điện thoại đồng bộ về PC |
+| 7.11 | **BLE beacon / cảm biến hiện diện** | App HA Companion phát iBeacon, hoặc Termux + `bluetoothctl` quét BLE | Cắm cố định một phòng để HA biết điện thoại nào đang ở phòng đó |
+| 7.12 | **Bộ xử lý DSP tai nghe** | JamesDSP (root): convolver, AutoEq, crossfeed, Dynamic Range Compressor | Đây chính là "bộ xử lý chuyên biệt" đúng nghĩa nhất với phần cứng của máy |
+| 7.13 | **Máy chạy thử nghiệm ARM64 / CI nhỏ** | Termux + SSH, hoặc chroot Debian (root) | Build/test package cho ARMv8.0 (không dotprod) – hữu ích khi cần kiểm tra tương thích với Pi 3 / Zero 2 W |
+
+### Nên chọn gì
+
+- Muốn "AI" thực sự có ích hằng ngày: **7.1 (Piper TTS đọc sách)** + **7.12 (JamesDSP)**. Cả hai nhẹ, chạy offline, tận dụng đúng điểm mạnh âm thanh của máy.
+- Muốn một hộp hạ tầng luôn bật: **7.7 (Snapcast endpoint)** hoặc **7.8 (Wyoming‑Piper cho HA)**.
+- Muốn nghịch LLM: Qwen2.5‑0.5B hoặc Llama 3.2 1B trong Termux, chấp nhận 2–8 token/giây.
+
+Nguồn thêm cho mục này:
+[Datasheet i.MX 8M Mini (NXP)](https://www.nxp.com/docs/en/data-sheet/IMX8MMIEC.pdf),
+[Benchmark LLM trên Raspberry Pi 5](https://tinyweights.dev/posts/run-llms-raspberry-pi-5/),
+[sherpa‑onnx TTS engine APK](https://k2-fsa.github.io/sherpa/onnx/tts/apk-engine.html),
+[Piper + sherpa‑onnx trên thiết bị](https://medium.com/@patare.vivek/running-neural-text-to-speech-on-device-with-piper-and-sherpa-onnx-58f4eed29247),
+[Termux PulseAudio OpenSL ES sink](https://github.com/termux/termux-packages/pull/6290).
