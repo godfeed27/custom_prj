@@ -22,7 +22,7 @@ chưa tìm được nguồn chắc chắn, cần tự thử trên máy.
 | Âm thanh | Ampli số S‑Master HX, DSEE HX, jack 3.5 mm unbalanced, 35 mW + 35 mW @ 16 Ω | Lý do chính để giữ máy |
 | Định dạng | MP3, WMA, AAC, FLAC, ALAC, AIFF, PCM, DSD (chuyển sang PCM) | |
 | Bluetooth | 5.0, phát LDAC / aptX HD / aptX / AAC / SBC, **không có chế độ nhận (receiver)** | Chỉ làm nguồn phát BT |
-| Wi‑Fi | 802.11a/b/g/n/ac, 2.4 + 5 GHz. Chip Qualcomm QCA9377 (module Murata Type 1PJ, driver `qcacld-2.0_sony`) | Thay thế hoàn toàn thẻ nhớ nếu có mạng. Ưu tiên 5 GHz |
+| Wi‑Fi | 802.11a/b/g/n/ac, 2.4 + 5 GHz. Chip Qualcomm QCA9377 (driver `qcacld-2.0_sony`; module Murata Type 1PJ theo trích đoạn; kiểm bằng `adb shell lsmod`, vendor SDIO 0x0271) | Thay thế hoàn toàn thẻ nhớ nếu có mạng. Ưu tiên 5 GHz |
 | NFC | Chỉ dùng ghép đôi 1 chạm với tai nghe/loa Sony | Không dùng được cho HCE/đọc thẻ |
 | USB‑C | Sạc + MTP/ADB. **Không có chế độ USB DAC.** USB host/OTG: **(chưa xác nhận)** | Cần tự thử OTG, xem mục 2 |
 | Nút cứng | Play, FF, REW, Vol +/−, nguồn, công tắc Hold | Remap được, dùng cho project không cần màn hình |
@@ -269,7 +269,7 @@ và `kernel_imx/walkman.config`). Đây là bằng chứng trực tiếp về nh
 | Lõi M4 | `m4_reserved` RAM tại 0x80000000, `&mu` + `&rpmsg` bật, node `sony,imx8mm-rpmsg-i2s` ("audio device in M4 domain"), `CONFIG_ICX_SILENT_LPA_LOG` | **Cortex‑M4 đang chạy firmware Low‑Power Audio của Sony**: A53 ngủ, M4 bơm PCM ra SAI. Đó là lý do pin 26 giờ. Có thể thay bằng firmware tự viết (8.5) |
 | MCU phụ | NXP **Kinetis MKL17Z32** (Cortex‑M0+) trên I2C 0x10, có chân `ucon_xfwupdate`, `ucon_req`, `ucon_xreset` | Vi điều khiển "ucon" của Sony, cập nhật firmware được từ A53. Chức năng chưa rõ (nghi quản lý nguồn/jack/DNC) – mục tiêu RE |
 | NFC | **NXP PN7150** (NCI controller đầy đủ) trên I2C 0x28 | Không phải tag thụ động: đọc/ghi thẻ NFC được nếu có stack (Android NFC hoặc Linux `nxp-nci` + neard) |
-| Wi‑Fi / BT | Qualcomm **QCA9377** (module Murata Type 1PJ): Wi‑Fi SDIO trên `usdhc1` (chân `WLAN_EN`), driver riêng của Sony `qcacld-2.0_sony` (module `wlan`); BT qua `uart1` HCI‑UART (QCA). `CONFIG_BRCMFMAC=m` cũng được build nhưng DTS không có node nào dùng, chỉ là phần thừa từ BSP của NXP | Mainline: có thể dùng `ath10k_sdio` (suy luận, cần thử). Wi‑Fi 2.4 GHz và BT dùng chung ăng‑ten |
+| Wi‑Fi / BT | Qualcomm **QCA9377** (DTS không ghi tên chip; suy từ driver riêng của Sony `qcacld-2.0_sony` (module `wlan`), bảng ID SDIO và firmware `qwlan30.bin`; tên module Murata Type 1PJ theo trích đoạn): Wi‑Fi SDIO trên `usdhc1` (chân `WLAN_EN`), BT qua `uart1` HCI‑UART (QCA). `CONFIG_BRCMFMAC=m` cũng được build nhưng DTS không có node nào dùng, chỉ là phần thừa từ BSP của NXP | Mainline: có thể dùng `ath10k_sdio` (suy luận, cần thử). Wi‑Fi và BT dùng chung ăng‑ten, chia thời gian (trích đoạn Qualcomm); chưa rõ 5 GHz có tránh được hay không |
 | UART console | `uart2` là `stdout-path` (console u‑boot/kernel) | **Có cổng debug trên PCB**, chỉ cần tìm test‑pad |
 | Màn hình / cảm ứng | Panel MIPI‑DSI **Himax HX83102D** 720×1280 (40×67 mm) qua LCDIF + NWL DSI, backlight PWM; cảm ứng Himax (`himax,hxcommon`) qua **SPI** | Mainline có `panel-himax-hx83102` (cần thêm chuỗi init từ driver Sony) |
 | Nguồn | PMIC ROHM **BD71837/BD71840**, sạc **BQ25898** (driver Sony `bq25898-icx`), đo pin **MAX1704x** (bảng model pin trong DTS), 2 vị trí gia tốc kế **BMA422** | PMIC + gauge có driver mainline; BQ25898 chưa có (ID khác bq25890), FUSB303 chưa có |
@@ -293,9 +293,9 @@ Khe thẻ "hỏng" thường là một trong ba trường hợp: (a) cơ cấu p
 
 ```
 # cần root (KernelSU/APatch). GPIO5_IO3 = số 131 trong sysfs/debugfs
-adb shell su -c "cat /sys/kernel/debug/gpio | grep -n 'gpio-131'"
+adb shell "su -c 'cat /sys/kernel/debug/gpio' | grep -n gpio-131"
 # cắm thẻ, giữ tay cho thẻ nằm đúng vị trí, chạy lại lệnh: giá trị phải đổi lo/hi
-adb shell su -c "dmesg | grep -iE 'mmc1|usdhc2|sd card'"
+adb shell "su -c dmesg | grep -iE 'mmc1|usdhc2|sd card'"
 ```
 
 - Giá trị đổi và `dmesg` thấy `mmc1: new ... SDXC card` → chỉ hỏng cơ cấu giữ thẻ: dán cố định thẻ, xong.
@@ -310,14 +310,14 @@ adb shell su -c "dmesg | grep -iE 'mmc1|usdhc2|sd card'"
    `nvp`, `boot`, `vbmeta`, `dtbo`, `vendor`). Kiểm tra HAB (secure boot) đã đóng chưa:
    ```
    # bank 1 word 3 bit 25 = SEC_CONFIG[1] trên i.MX 8M Mini
-   adb shell su -c "dd if=/sys/bus/nvmem/devices/imx-ocotp0/nvmem bs=4 skip=7 count=1 2>/dev/null | xxd"
+   adb shell "su -c 'dd if=/sys/bus/nvmem/devices/imx-ocotp0/nvmem bs=4 skip=7 count=1 2>/dev/null' | xxd"
    ```
    HAB đóng → **không bao giờ** động vào u‑boot/SPL của Sony; chỉ thay boot image (u‑boot Sony vẫn
    nạp kernel bất kỳ sau `oem unlock`, đã chứng minh bằng kernel KernelSU).
 2. **UART**: tìm test‑pad của `uart2` trên PCB (3 chân TX/RX/GND, thử mức 1.8 V trước), lấy log u‑boot.
    Không bắt buộc nhưng rút ngắn mọi bước sau rất nhiều.
 3. **Dual‑boot bằng A/B**: giữ Android ở slot A, flash kernel mainline vào `boot_b`,
-   `fastboot --set-active=b`. Rootfs đặt trên USB flash qua OTG (H1 đã chứng minh host mode) hoặc
+   `fastboot --set-active=b`. Rootfs đặt trên USB flash qua OTG (chỉ khi bước 3 của mục 8.7 đã xác nhận host mode; H1 chạy ở chế độ gadget nên không chứng minh được) hoặc
    trên `userdata`. Hỏng thì `--set-active=a` quay lại Android.
 4. **Bring‑up theo thứ tự**: SoC + PMIC BD71837 + eMMC + UART (có sẵn trong `imx8mm-evk.dts`, copy
    sang `imx8mm-sony-icx1293.dts`) → nút bấm `gpio-keys` → Wi‑Fi QCA9377 SDIO (thử `ath10k_sdio`; firmware
@@ -380,12 +380,12 @@ Tóm tắt:
 | Muốn gì | Dùng gì | Đổi lại |
 |---|---|---|
 | Nghe ngay, miễn phí | AirPlay Receiver của jqssun, Mac chọn trong Control Center › Sound | ALAC 44.1/16, trễ ~2 s. Có thể không kết nối được: UxPlay chỉ hỗ trợ FairPlay loại 3 |
-| Nghe ngay, chắc chạy | Airfoil (Mac, trả phí) + Airfoil Satellite (A105) | Trễ ~2 s, ít thông số |
-| Trễ thấp, miễn phí | roc‑vad + roc‑droid 0.2.2, hoặc SonoBus + BlackHole | Không điều khiển được Mac từ A105 |
-| **Đúng ý: nút cứng điều khiển Mac, màn hình thông số, 24‑bit** | **Tự xây WalkDAC**: helper Mac (BlackHole/process tap + mediaremote-adapter) + app A105 (AudioTrack float, bộ đệm 400–500 ms, MediaSession) | Phải viết code. Không cần root |
+| Nghe ngay, khả năng chạy cao | Airfoil (Mac, trả phí, có bản dùng thử) + Airfoil Satellite (A105) | Trễ ~2 s, ít thông số. Chưa ai thử trên A105; có báo lỗi mất tiếng trên macOS 26 |
+| Trễ thấp, miễn phí | roc‑vad + roc‑droid 0.2.2, hoặc SonoBus + BlackHole | Không điều khiển được Mac từ A105. roc chỉ 16‑bit/44.1 kHz; roc‑droid 0.2.2 (libroc 0.2.x) và roc‑vad (roc‑toolkit 0.4) chưa ai xác nhận tương thích |
+| **Đúng ý: nút cứng điều khiển Mac, màn hình thông số** (24‑bit chỉ có ích khi bật High‑Res streaming) | **Tự xây WalkDAC**: helper Mac (BlackHole/process tap + mediaremote-adapter) + app A105 (AudioTrack float, bộ đệm 400–500 ms, MediaSession) | Phải viết code. Không cần root |
 | Bit‑perfect | WalkDAC + daemon root ghi thẳng ALSA `hires-out` | Cần root |
 | Mac gửi qua Bluetooth | A2DP sink sau khi root | SBC/AAC 16‑bit, không ra được loa BT cùng lúc, phụ thuộc cờ biên dịch của Sony |
 
 Hai giới hạn của A105 cần nhớ:
-- App bên thứ ba không bao giờ bit‑perfect trên firmware gốc. *High‑Res streaming* OFF thì ra 48 kHz/16‑bit, ON thì ra 192 kHz/32‑bit.
+- App bên thứ ba không bit‑perfect trên firmware gốc (theo trích đoạn Help Guide của Sony, cần kiểm bằng `dumpsys`). *High‑Res streaming* OFF thì ra 48 kHz/16‑bit, ON thì ra 192 kHz/32‑bit. Nên để OFF và gửi 48 kHz.
 - Khoá Wi‑Fi `WIFI_MODE_FULL_HIGH_PERF` không có tác dụng trên QCA9377 + Android 9. App phải giữ wake lock và gửi gói đều.
