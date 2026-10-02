@@ -22,7 +22,7 @@ chưa tìm được nguồn chắc chắn, cần tự thử trên máy.
 | Âm thanh | Ampli số S‑Master HX, DSEE HX, jack 3.5 mm unbalanced, 35 mW + 35 mW @ 16 Ω | Lý do chính để giữ máy |
 | Định dạng | MP3, WMA, AAC, FLAC, ALAC, AIFF, PCM, DSD (chuyển sang PCM) | |
 | Bluetooth | 5.0, phát LDAC / aptX HD / aptX / AAC / SBC, **không có chế độ nhận (receiver)** | Chỉ làm nguồn phát BT |
-| Wi‑Fi | Có (dùng được cho streaming, NAS, SSH) | Thay thế hoàn toàn thẻ nhớ nếu có mạng |
+| Wi‑Fi | 802.11a/b/g/n/ac, 2.4 + 5 GHz. Chip Qualcomm QCA9377 (module Murata Type 1PJ, driver `qcacld-2.0_sony`) | Thay thế hoàn toàn thẻ nhớ nếu có mạng. Ưu tiên 5 GHz |
 | NFC | Chỉ dùng ghép đôi 1 chạm với tai nghe/loa Sony | Không dùng được cho HCE/đọc thẻ |
 | USB‑C | Sạc + MTP/ADB. **Không có chế độ USB DAC.** USB host/OTG: **(chưa xác nhận)** | Cần tự thử OTG, xem mục 2 |
 | Nút cứng | Play, FF, REW, Vol +/−, nguồn, công tắc Hold | Remap được, dùng cho project không cần màn hình |
@@ -49,7 +49,9 @@ chưa tìm được nguồn chắc chắn, cần tự thử trên máy.
 Thứ tự ưu tiên, từ dễ đến khó:
 
 1. **Stream qua Wi‑Fi** – Spotify, Apple Music, Tidal, Qobuz, YouTube Music chạy trực tiếp.
-   DSEE HX / EQ của Sony áp dụng hệ thống nên nhạc stream vẫn qua đường xử lý của Walkman.
+   Hiệu ứng Sony (EQ, DSEE HX, ClearAudio+…) nằm trong HAL nên áp lên mọi app nếu đang bật; *Direct Source* bỏ qua hết.
+   Lưu ý công tắc *Settings › Sound › High‑Res streaming*: tắt thì app bên thứ ba bị hạ về 48 kHz/16‑bit,
+   bật thì bị nâng lên 192 kHz/32‑bit (xem [docs/a105-wifi-dac.md](docs/a105-wifi-dac.md) mục 5).
 2. **Phát nhạc từ NAS / PC trong nhà** – không cần copy gì vào máy:
    - Navidrome / Jellyfin / Plex trên PC hoặc NAS → app Symfonium, Finamp, Ultrasonic, DSub trên Walkman.
    - Chia sẻ SMB / DLNA → USB Audio Player PRO, Neutron, BubbleUPnP, Hi‑Fi Cast.
@@ -76,7 +78,7 @@ Thứ tự ưu tiên, từ dễ đến khó:
 | # | Project | Tận dụng | Cách làm tóm tắt |
 |---|---|---|---|
 | 0.1 | **Máy nghe nhạc mạng (NAS player)** | Wi‑Fi, S‑Master HX, DSEE HX | Dựng Navidrome trên PC/NAS → cài Symfonium. Toàn bộ thư viện FLAC nằm ở nhà, Walkman chỉ là "đầu phát" |
-| 0.2 | **Streamer cho dàn âm thanh ở nhà** | Jack 3.5 mm, Wi‑Fi, cắm sạc liên tục | Cắm 3.5 mm → ampli. Cài AirReceiver (AirPlay/DLNA receiver), bật Spotify Connect / Tidal Connect. Điều khiển từ điện thoại. Thay thế được chế độ USB DAC bị thiếu: PC → cast qua Wi‑Fi → Walkman → ampli. Bật "Battery Care" (nếu máy có) để không chai pin |
+| 0.2 | **Streamer cho dàn âm thanh ở nhà** | Jack 3.5 mm, Wi‑Fi, cắm sạc liên tục | Cắm 3.5 mm → ampli. Spotify Connect chạy sẵn (app Spotify trên A105). Âm thanh từ Mac: thử AirPlay Receiver của jqssun, hoặc Airfoil Satellite, roc‑droid, SonoBus. Thay thế được chế độ USB DAC bị thiếu: Mac → Wi‑Fi → Walkman → ampli. Chi tiết và bản tự xây có điều khiển + màn hình thông số: mục 9 và [docs/a105-wifi-dac.md](docs/a105-wifi-dac.md). Pin: xem mục 9 của tài liệu đó |
 | 0.3 | **Nguồn phát Bluetooth LDAC** | BT 5.0 LDAC/aptX HD, NFC | Dùng làm nguồn phát hi‑res cho tai nghe/loa BT, xe hơi. NFC chạm để pair với tai nghe Sony |
 | 0.4 | **Podcast / audiobook player chuyên dụng** | Bộ nhớ trong nhỏ vẫn đủ | AntennaPod, Smart AudioBook Player; file nhỏ, tải theo tập |
 | 0.5 | **Đồng bộ nhạc không dây** | Wi‑Fi, bộ nhớ trong | Syncthing‑Fork: PC push playlist ~5 GB sang máy, xoá tự động khi đổi playlist |
@@ -267,7 +269,7 @@ và `kernel_imx/walkman.config`). Đây là bằng chứng trực tiếp về nh
 | Lõi M4 | `m4_reserved` RAM tại 0x80000000, `&mu` + `&rpmsg` bật, node `sony,imx8mm-rpmsg-i2s` ("audio device in M4 domain"), `CONFIG_ICX_SILENT_LPA_LOG` | **Cortex‑M4 đang chạy firmware Low‑Power Audio của Sony**: A53 ngủ, M4 bơm PCM ra SAI. Đó là lý do pin 26 giờ. Có thể thay bằng firmware tự viết (8.5) |
 | MCU phụ | NXP **Kinetis MKL17Z32** (Cortex‑M0+) trên I2C 0x10, có chân `ucon_xfwupdate`, `ucon_req`, `ucon_xreset` | Vi điều khiển "ucon" của Sony, cập nhật firmware được từ A53. Chức năng chưa rõ (nghi quản lý nguồn/jack/DNC) – mục tiêu RE |
 | NFC | **NXP PN7150** (NCI controller đầy đủ) trên I2C 0x28 | Không phải tag thụ động: đọc/ghi thẻ NFC được nếu có stack (Android NFC hoặc Linux `nxp-nci` + neard) |
-| Wi‑Fi / BT | Wi‑Fi SDIO `brcmfmac` trên `usdhc1` (chân `WLAN_EN`), BT qua `uart1` HCI‑UART Broadcom | Module Broadcom/Cypress, mainline hỗ trợ tốt |
+| Wi‑Fi / BT | Qualcomm **QCA9377** (module Murata Type 1PJ): Wi‑Fi SDIO trên `usdhc1` (chân `WLAN_EN`), driver riêng của Sony `qcacld-2.0_sony` (module `wlan`); BT qua `uart1` HCI‑UART (QCA). `CONFIG_BRCMFMAC=m` cũng được build nhưng DTS không có node nào dùng, chỉ là phần thừa từ BSP của NXP | Mainline: có thể dùng `ath10k_sdio` (suy luận, cần thử). Wi‑Fi 2.4 GHz và BT dùng chung ăng‑ten |
 | UART console | `uart2` là `stdout-path` (console u‑boot/kernel) | **Có cổng debug trên PCB**, chỉ cần tìm test‑pad |
 | Màn hình / cảm ứng | Panel MIPI‑DSI **Himax HX83102D** 720×1280 (40×67 mm) qua LCDIF + NWL DSI, backlight PWM; cảm ứng Himax (`himax,hxcommon`) qua **SPI** | Mainline có `panel-himax-hx83102` (cần thêm chuỗi init từ driver Sony) |
 | Nguồn | PMIC ROHM **BD71837/BD71840**, sạc **BQ25898** (driver Sony `bq25898-icx`), đo pin **MAX1704x** (bảng model pin trong DTS), 2 vị trí gia tốc kế **BMA422** | PMIC + gauge có driver mainline; BQ25898 chưa có (ID khác bq25890), FUSB303 chưa có |
@@ -278,8 +280,8 @@ và `kernel_imx/walkman.config`). Đây là bằng chứng trực tiếp về nh
 
 | # | Project | Lời được gì | Việc phải làm | Rủi ro |
 |---|---|---|---|---|
-| H1 | **USB DAC mode bằng kernel** (gadget UAC2) | Walkman thành card âm thanh USB cho PC/điện thoại: PC → USB‑C → S‑Master HX → tai nghe. Tính năng Sony đã bỏ | Build kernel với `CONFIG_USB_CONFIGFS_F_UAC2=y`; tạo function `uac2.0` trong configfs cạnh `mtp`/`ffs`; viết daemon nhỏ (tinyalsa) đọc PCM từ gadget và đẩy vào AudioFlinger (hoặc Termux `arecord | pacat`) để vẫn đi qua DSEE/EQ | Thấp: chỉ kernel + userland, hoàn tác bằng flash lại boot |
-| H2 | **Bluetooth receiver (A2DP sink)** | Điện thoại phát BT → Walkman → ampli/tai nghe. Tính năng thứ hai Sony đã bỏ | Trên Android 9: overlay `profile_supported_a2dp_sink=true` vào `/vendor/overlay` + route "A2DP In" trong audio policy của Sony. 50/50 vì HAL của Sony có thể không có đường vào này. Trên Linux (H4): BlueZ + PipeWire làm sẵn | Trung bình |
+| H1 | **USB DAC mode bằng kernel** (gadget UAC2) | Walkman thành card âm thanh USB cho PC/điện thoại: PC → USB‑C → S‑Master HX → tai nghe. Tính năng Sony đã bỏ | Build kernel với `CONFIG_USB_CONFIGFS_F_UAC2=y`; tạo function `uac2.0` trong configfs cạnh `mtp`/`ffs`; viết daemon nhỏ (tinyalsa) đọc PCM từ gadget và đẩy vào AudioFlinger (hoặc Termux `arecord | pacat`) để vẫn đi qua DSEE/EQ. Đã có đề án cộng đồng He0xD4C0/A100_ZX500_USB-DAC (2026, chưa kiểm chứng). Lưu ý kernel 4.14: `f_uac2` chỉ một rate cố định và không có feedback endpoint, nên trôi đồng hồ gây tiếng click | Thấp: chỉ kernel + userland, hoàn tác bằng flash lại boot |
+| H2 | **Bluetooth receiver (A2DP sink)** | Điện thoại phát BT → Walkman → ampli/tai nghe. Tính năng thứ hai Sony đã bỏ | Trên Android 9: RRO bật `profile_supported_a2dp_sink`/`avrcp_controller` và tắt source, `pm enable` các service sink, app đi kèm gọi `prepare()` để giữ audio focus. Ba giới hạn: Android 9 không chạy source và sink cùng lúc (mất tai nghe BT khi đang làm loa); chỉ SBC/AAC 16‑bit; Mac chỉ thấy A105 nếu `libbluetooth.so` của Sony được build với `BTA_AV_SINK_INCLUDED=TRUE` (chưa biết). Chi tiết: [docs/a105-wifi-dac.md](docs/a105-wifi-dac.md) mục 7. Trên Linux (H4): BlueZ + PipeWire làm sẵn | Trung bình |
 | H3 | **"Walkman One" cho A100** – mod bảng tuning CXD3778GF | Đổi chất âm ở tầng driver, giống các mod nổi tiếng của dòng WM1A/ZX300 (cùng họ codec). Chưa ai làm cho Android Walkman | Đọc `cxd3778gf_table.c`, `cxd3778gf_register.c`; dùng `cxd3778gf_regmon` để xem thanh ghi lúc chạy; thử bảng của ICX1295 (ZX500) trên ICX1293 cho đường SE; build kernel | Trung bình: sai bảng có thể tắt tiếng, không hỏng phần cứng |
 | H4 | **Mainline Linux / postmarketOS** | Hệ điều hành của riêng bạn: MPD + librespot + shairport‑sync + snapclient + BlueZ A2DP sink + UAC2 gadget + NFC tap‑to‑play. Mọi thứ Sony bỏ đều có trên Linux | Xem lộ trình 8.4 | Cao về thời gian, thấp về brick (giữ u‑boot Sony, dùng slot B) |
 | H5 | **Firmware M4 tự viết** | Low‑Power Audio của riêng bạn (ví dụ decode FLAC trên M4 để A53 ngủ lâu hơn), hoặc M4 làm việc khác khi chạy Linux | SDK MCUXpresso `evkmimx8mm/demo_apps/sai_low_power_audio` là mã nguồn mở của chính cơ chế Sony dùng; cần nạp qua `imx_rproc` (mainline) hoặc u‑boot `bootaux` | Cao: chỉ hợp lý sau H4 |
@@ -318,8 +320,8 @@ adb shell su -c "dmesg | grep -iE 'mmc1|usdhc2|sd card'"
    `fastboot --set-active=b`. Rootfs đặt trên USB flash qua OTG (H1 đã chứng minh host mode) hoặc
    trên `userdata`. Hỏng thì `--set-active=a` quay lại Android.
 4. **Bring‑up theo thứ tự**: SoC + PMIC BD71837 + eMMC + UART (có sẵn trong `imx8mm-evk.dts`, copy
-   sang `imx8mm-sony-icx1293.dts`) → nút bấm `gpio-keys` → Wi‑Fi `brcmfmac` (cần firmware/NVRAM từ
-   `/vendor/firmware`) → BT HCI‑UART → panel HX83102D (thêm chuỗi init lấy từ driver Sony vào
+   sang `imx8mm-sony-icx1293.dts`) → nút bấm `gpio-keys` → Wi‑Fi QCA9377 SDIO (thử `ath10k_sdio`; firmware
+   `qwlan30.bin`/`bdwlan30.bin`/`otp30.bin` lấy từ phân vùng vendor) → BT HCI‑UART → panel HX83102D (thêm chuỗi init lấy từ driver Sony vào
    `panel-himax-hx83102`) → cảm ứng Himax SPI (port driver Sony) → sạc/gauge (port `bq25898-icx`,
    MAX1704x có sẵn) → Type‑C (port `fusb303d` của Sony, mainline chưa có) → **codec CXD3778GF**
    (port ASoC driver Sony, việc lớn nhất) → GPU etnaviv, VPU hantro → NFC `nxp-nci` → M4 `imx_rproc`.
@@ -365,3 +367,25 @@ Nguồn: DTS và config trong [97lily/2019_android_walkman](https://github.com/9
 [panel-himax-hx83102 mainline](https://codebrowser.dev/linux/linux/drivers/gpu/drm/panel/panel-himax-hx83102.c.html),
 [bq25890_charger mainline và giới hạn với BQ25898](https://e2e.ti.com/support/power-management-group/power-management/f/power-management-forum/589850/linux-bq25898d-bq25898d),
 [FUSB303 datasheet](https://www.onsemi.com/download/data-sheet/pdf/fusb303b-d.pdf).
+
+---
+
+## 9. A105 làm DAC không dây cho Mac (Wi‑Fi / Bluetooth)
+
+Mac → A105 → loa, điều khiển trên A105, màn hình hiện thông số. Thiết kế đầy đủ, lệnh cài đặt và checklist kiểm tra:
+**[docs/a105-wifi-dac.md](docs/a105-wifi-dac.md)**.
+
+Tóm tắt:
+
+| Muốn gì | Dùng gì | Đổi lại |
+|---|---|---|
+| Nghe ngay, miễn phí | AirPlay Receiver của jqssun, Mac chọn trong Control Center › Sound | ALAC 44.1/16, trễ ~2 s. Có thể không kết nối được: UxPlay chỉ hỗ trợ FairPlay loại 3 |
+| Nghe ngay, chắc chạy | Airfoil (Mac, trả phí) + Airfoil Satellite (A105) | Trễ ~2 s, ít thông số |
+| Trễ thấp, miễn phí | roc‑vad + roc‑droid 0.2.2, hoặc SonoBus + BlackHole | Không điều khiển được Mac từ A105 |
+| **Đúng ý: nút cứng điều khiển Mac, màn hình thông số, 24‑bit** | **Tự xây WalkDAC**: helper Mac (BlackHole/process tap + mediaremote-adapter) + app A105 (AudioTrack float, bộ đệm 400–500 ms, MediaSession) | Phải viết code. Không cần root |
+| Bit‑perfect | WalkDAC + daemon root ghi thẳng ALSA `hires-out` | Cần root |
+| Mac gửi qua Bluetooth | A2DP sink sau khi root | SBC/AAC 16‑bit, không ra được loa BT cùng lúc, phụ thuộc cờ biên dịch của Sony |
+
+Hai giới hạn của A105 cần nhớ:
+- App bên thứ ba không bao giờ bit‑perfect trên firmware gốc. *High‑Res streaming* OFF thì ra 48 kHz/16‑bit, ON thì ra 192 kHz/32‑bit.
+- Khoá Wi‑Fi `WIFI_MODE_FULL_HIGH_PERF` không có tác dụng trên QCA9377 + Android 9. App phải giữ wake lock và gửi gói đều.
