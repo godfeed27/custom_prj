@@ -1,0 +1,13 @@
+# Gradle / Android build output
+**/build/
+**/.gradle/
+**/.kotlin/
+android/local.properties
+android/.idea/
+android/*.iml
+android/app/*.iml
+android/core/*.iml
+# Python
+sender/__pycache__/
+sender/tests/__pycache__/
+sender/.venv/

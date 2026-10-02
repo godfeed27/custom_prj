@@ -454,6 +454,9 @@ Ghép Oboe + libFLAC + speexdsp thì app có thể giữ giấy phép tuỳ ý.
 
 ### 4.8 Lộ trình build
 
+> **Đã có mã nguồn MVP (M1–M3, một phần M4)** trong [`walkdac/`](../walkdac/README.md): sender Python cho Mac, app Kotlin cho A105,
+> test tự động và hướng dẫn chạy. Chưa thử trên máy thật.
+
 1. **M0 – Kiểm tra trên máy** (mục 10): chip Wi‑Fi, nút cứng, đường âm thanh với High‑Res streaming ON/OFF, iperf3 trên 5 GHz khi tắt màn.
 2. **M1 – Phát được**: helper dòng lệnh (có thể viết Python/Swift) đọc BlackHole và gửi PCM 48/16 qua TCP. App A105 nhận và phát bằng AudioTrack.
 3. **M2 – Ổn định**: bộ đệm jitter, bù trôi PI, đồng bộ lại cứng, foreground service, tự kết nối lại, Bonjour.

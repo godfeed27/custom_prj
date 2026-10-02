@@ -386,6 +386,8 @@ Tóm tắt:
 | Bit‑perfect | WalkDAC + daemon root ghi thẳng ALSA `hires-out` | Cần root |
 | Mac gửi qua Bluetooth | A2DP sink sau khi root | SBC/AAC 16‑bit, không ra được loa BT cùng lúc, phụ thuộc cờ biên dịch của Sony |
 
+**Mã nguồn MVP** của bản tự xây nằm trong [`walkdac/`](walkdac/README.md) (sender Python + app Android + test). Chưa thử trên máy thật.
+
 Hai giới hạn của A105 cần nhớ:
 - App bên thứ ba không bit‑perfect trên firmware gốc (theo trích đoạn Help Guide của Sony, cần kiểm bằng `dumpsys`). *High‑Res streaming* OFF thì ra 48 kHz/16‑bit, ON thì ra 192 kHz/32‑bit. Nên để OFF và gửi 48 kHz.
 - Khoá Wi‑Fi `WIFI_MODE_FULL_HIGH_PERF` không có tác dụng trên QCA9377 + Android 9. App phải giữ wake lock và gửi gói đều.
