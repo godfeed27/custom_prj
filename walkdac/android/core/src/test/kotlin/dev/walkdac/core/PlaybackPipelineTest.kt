@@ -125,4 +125,58 @@ class PlaybackPipelineTest {
         assertEquals(PlaybackPipeline.State.PREBUFFER, p.state)
         assertEquals(0, p.buffer.availableFrames)
     }
+
+    @Test fun burstAfterStallIsTrimmedToTarget() {
+        // 0.8 s stall at t=10 s, then the backlog arrives in one burst
+        val p = PlaybackPipeline(rate, ch, block, 450.0)
+        val gen = SineGen(rate)
+        val out = FloatArray(block * ch)
+        var maxFillAfter = 0.0
+        val pending = ArrayList<FloatArray>()
+        for (j in 0 until 3000) { // 30 s
+            val t = j * 0.01
+            val b = gen.block(block, ch)
+            if (t >= 10.0 && t < 10.8) pending.add(b) else {
+                for (q in pending) p.push(q, 0, q.size)
+                pending.clear()
+                p.push(b, 0, b.size)
+            }
+            p.nextBlock(out)
+            if (t > 12.0) maxFillAfter = maxOf(maxFillAfter, p.fillMs)
+        }
+        assertEquals(1, p.underruns)
+        assertTrue("max fill after recovery $maxFillAfter", maxFillAfter < 450.0 + 3 * 10.0)
+    }
+
+    @Test fun targetChangeTakesEffectQuickly() {
+        val p = PlaybackPipeline(rate, ch, block, 450.0)
+        val gen = SineGen(rate)
+        val out = FloatArray(block * ch)
+        fun run(seconds: Double) { repeat((seconds * 100).toInt()) { val b = gen.block(block, ch); p.push(b, 0, b.size); p.nextBlock(out) } }
+        run(15.0)
+        p.targetMs = 1000.0
+        run(2.0)
+        assertTrue("raised: fill ${p.fillMs}", p.fillMs > 950.0)
+        assertEquals(PlaybackPipeline.State.PLAYING, p.state)
+        p.targetMs = 450.0
+        run(1.0)
+        assertTrue("lowered: fill ${p.fillMs}", p.fillMs < 450.0 + 3 * 10.0)
+        assertEquals(0, p.underruns)
+    }
+
+    @Test fun flushBetweenFillReadAndReadDoesNotCrash() {
+        val ra = RateAdjuster(2)
+        val out = FloatArray(480 * 2) { 1f }
+        ra.process(FloatArray(0), 0, out, 480)
+        assertTrue(out.all { it == 0f })
+        // concurrent flushes while the audio thread runs
+        val p = PlaybackPipeline(rate, ch, block, 50.0)
+        val gen = SineGen(rate)
+        val stop = java.util.concurrent.atomic.AtomicBoolean(false)
+        val flusher = Thread { while (!stop.get()) { p.flush(); Thread.yield() } }
+        flusher.start()
+        try {
+            repeat(20000) { val b = gen.block(block, ch); p.push(b, 0, b.size); p.nextBlock(out) }
+        } finally { stop.set(true); flusher.join() }
+    }
 }

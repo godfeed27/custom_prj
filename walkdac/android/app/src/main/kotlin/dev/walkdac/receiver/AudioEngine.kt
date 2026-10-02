@@ -29,6 +29,9 @@ class AudioEngine(val sampleRate: Int, targetMs: Double) {
         private set
     @Volatile var lastError: String? = null
         private set
+    /** False once the output thread has exited (error, dead AudioTrack after an audioserver restart, or stop()). */
+    @Volatile var alive: Boolean = false
+        private set
     val trackBufferFrames: Int get() = track?.bufferSizeInFrames ?: 0
 
     fun routedDeviceType(): Int = track?.routedDevice?.type ?: 0
@@ -58,15 +61,16 @@ class AudioEngine(val sampleRate: Int, targetMs: Double) {
         }
         track = t
         running = true
+        alive = true
         thread = Thread({ loop(t) }, "walkdac-audio-out").apply { start() }
     }
 
     private fun loop(t: AudioTrack) {
-        Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
         val block = FloatArray(blockFrames * channels)
         val ts = AudioTimestamp()
         var blocks = 0L
         try {
+            Process.setThreadPriority(Process.THREAD_PRIORITY_URGENT_AUDIO)
             t.play()
             while (running) {
                 pipeline.nextBlock(block)
@@ -91,6 +95,7 @@ class AudioEngine(val sampleRate: Int, targetMs: Double) {
             lastError = e.message ?: e.toString()
             Log.e(TAG, "audio thread died", e)
         } finally {
+            alive = false
             try { t.pause(); t.flush() } catch (e: Exception) { /* ignore */ }
             t.release()
         }

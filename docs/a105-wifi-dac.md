@@ -297,21 +297,29 @@ Quy tắc bắt buộc:
 | 24 | 4 | payload_len |
 | 28 | … | payload |
 
-**Kênh điều khiển**: WebSocket JSON.
+**Kênh điều khiển**: JSON lines (UTF‑8, một thông điệp mỗi dòng) qua TCP 7701. Đây là giao thức bản MVP trong `walkdac/` đang dùng.
 
 ```jsonc
-// Mac → A105
-{"t":"source","app":"com.spotify.client","capture":"blackhole","device_rate":48000,"codec":"flac","bits":24}
-{"t":"now_playing","title":"…","artist":"…","album":"…","duration_us":245000000,
- "elapsed_us":83000000,"rate":1.0,"ts_us":1759390000000000,"artwork_jpeg_b64":"…"}   // ảnh bìa gửi 1 lần/bài, ~500 px
-{"t":"time","id":17,"mac_ns":123456789}
 // A105 → Mac
-{"t":"time_ack","id":17,"a105_ns":987654321}
-{"t":"cmd","op":"toggle"}            // play | pause | toggle | next | prev | seek (pos_us) | volume (value, chỉ khi dùng 4.5 b)
-{"t":"stats","buffer_ms":482,"underruns":0,"lost":0,"drift_ppm":41,"rssi":-52}
-// Mac → A105, sau khi lệnh có tác dụng
-{"t":"flush","from_seq":1234}        // bỏ mọi khối có seq < from_seq
+{"t":"hello","name":"NW-A105 WalkDAC","ver":1}
+{"t":"time","id":17,"a105_ns":987654321}             // 50 lần cách 100 ms khi kết nối, sau đó 1 lần/s
+{"t":"cmd","op":"toggle"}                            // play | pause | toggle | next | prev | seek (pos_us)
+{"t":"stats","buffer_ms":482,"target_ms":450,"underruns":0,"lost":0,"drift_ppm":41,"jitter_ms":1.2,"rssi":-52}
+// Mac → A105
+{"t":"source","name":"MacBook","device":"BlackHole 2ch","capture":"device","rate":48000,"codec":"pcm_s24",
+ "bits":24,"channels":2,"block_ms":10,"ver":1,"media_control":true}
+{"t":"now_playing","app":"com.spotify.client","playing":true,"title":"…","artist":"…","album":"…",
+ "duration_us":245000000,"elapsed_us":83000000,"rate":1.0,"at_mac_ns":123456789,
+ "artwork_b64":"…","artwork_mime":"image/jpeg"}      // at_mac_ns: đồng hồ monotonic của Mac, cùng đồng hồ với capture_ns
+{"t":"time_ack","id":17,"a105_ns":987654321,"mac_ns":123456789}
+{"t":"cmd_ack","op":"toggle","ok":true,"error":""}
+{"t":"flush","from_seq":1234}                        // bỏ mọi khối có seq < from_seq (mod 2^32)
+// Beacon: UDP broadcast cổng 7702 mỗi 2 s
+{"t":"beacon","name":"MacBook","audio_port":7700,"control_port":7701,"ver":1,"rate":48000,"codec":"pcm_s24"}
 ```
+
+`artwork_b64` chỉ có khi ảnh bìa đổi (giá trị `null` nghĩa là bài hiện tại không có ảnh). Bản MVP gửi PCM, chưa dùng FLAC.
+Âm lượng do A105 tự xử lý (4.5 a), nên chưa có lệnh `volume`.
 
 A105 giữ 0.4–0.5 s âm thanh trong bộ đệm, nên nếu chỉ gửi lệnh rồi chờ thì bấm pause/next vẫn nghe nửa giây bài cũ.
 Vì vậy khi bấm pause/next/prev/seek, app A105 tự giảm âm về 0 trong ~20 ms và xả bộ đệm ngay, rồi mới gửi `cmd`.

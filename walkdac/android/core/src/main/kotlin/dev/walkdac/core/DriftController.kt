@@ -79,6 +79,10 @@ class RateAdjuster(val channels: Int) {
      */
     fun process(input: FloatArray, inFrames: Int, out: FloatArray, outFrames: Int) {
         val ch = channels
+        if (inFrames <= 0) {
+            java.util.Arrays.fill(out, 0, outFrames * ch, 0f)
+            return
+        }
         val delta = inFrames - outFrames
         if (delta == 0) {
             System.arraycopy(input, 0, out, 0, outFrames * ch)

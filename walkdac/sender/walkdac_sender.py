@@ -16,6 +16,7 @@ import json
 import math
 import os
 import queue
+import re
 import shutil
 import socket
 import struct
@@ -278,10 +279,12 @@ class AudioServer:
 # ----------------------------------------------------------------------------- media-control bridge
 
 class NowPlaying:
-    """Keeps the merged now-playing state from `media-control stream` and runs transport commands."""
+    """Keeps the merged now-playing state from `media-control stream --micros` and runs transport commands."""
 
-    KEYS = ("bundleIdentifier", "playing", "title", "artist", "album", "duration", "elapsedTime",
-            "playbackRate", "artworkMimeType")
+    KEYS = ("bundleIdentifier", "playing", "title", "artist", "album", "durationMicros", "elapsedTimeMicros",
+            "timestampEpochMicros", "playbackRate", "artworkMimeType")
+    # Keys whose presence means the timeline anchor (elapsed time + the instant it was valid) moved.
+    POS_KEYS = ("elapsedTimeMicros", "timestampEpochMicros", "playing", "playbackRate")
 
     def __init__(self, enabled: bool, on_change: Callable[[dict, bool], None]):
         self.binary = shutil.which("media-control") if enabled else None
@@ -289,7 +292,7 @@ class NowPlaying:
         self.state: dict = {}
         self.artwork_b64: Optional[str] = None
         self.artwork_mime: Optional[str] = None
-        self.received_at_ns = 0
+        self.anchor_ns = 0  # sender monotonic ns at which state["elapsedTimeMicros"] was valid
         self.lock = threading.Lock()
         self._proc: Optional[subprocess.Popen] = None
         self._stop = threading.Event()
@@ -299,16 +302,30 @@ class NowPlaying:
         if not self.binary:
             log("media-control not found: now playing and transport control are off (brew install media-control)")
             return
+        try:
+            r = subprocess.run([self.binary, "test"], capture_output=True, text=True, timeout=20)
+            ok = r.returncode == 0
+            err = (r.stderr or r.stdout or "").strip()[:300] or "exit %d" % r.returncode
+        except (OSError, subprocess.TimeoutExpired) as e:
+            ok, err = False, str(e)
+        if not ok:
+            log("media-control self-test failed (%s): now playing + transport control are OFF. "
+                "Try: brew upgrade media-control; media-control get" % err)
+            self.available = False
+            return
         threading.Thread(target=self._stream_loop, name="media-control", daemon=True).start()
 
     def _stream_loop(self) -> None:
+        backoff = 3.0
         while not self._stop.is_set():
+            started = time.monotonic()
             try:
-                self._proc = subprocess.Popen([self.binary, "stream"], stdout=subprocess.PIPE,
-                                              stderr=subprocess.DEVNULL, text=True, bufsize=1)
+                # stderr is inherited so the adapter's own error text reaches the terminal
+                self._proc = subprocess.Popen([self.binary, "stream", "--micros"], stdout=subprocess.PIPE,
+                                              stderr=None, text=True, bufsize=1)
             except OSError as e:
                 log("media-control stream failed: %s" % e)
-                time.sleep(5)
+                self._stop.wait(5)
                 continue
             assert self._proc.stdout is not None
             for line in self._proc.stdout:
@@ -317,39 +334,54 @@ class NowPlaying:
                     continue
                 try:
                     msg = json.loads(line)
-                except ValueError:
-                    continue
-                self._apply(msg)
+                    if isinstance(msg, dict):
+                        self._apply(msg)
+                except Exception as e:  # noqa: BLE001 - one bad line must not kill the thread
+                    log("media-control: ignored line (%s)" % e)
             self._proc.wait()
-            if not self._stop.is_set():
-                log("media-control stream exited (code %s); restarting in 3 s" % self._proc.returncode)
-                time.sleep(3)
+            if self._stop.is_set():
+                break
+            backoff = 3.0 if time.monotonic() - started > 30 else min(backoff * 2, 60.0)
+            log("media-control stream exited (code %s); restarting in %.0f s" % (self._proc.returncode, backoff))
+            self._stop.wait(backoff)
+
+    def _anchor_from(self, payload: dict) -> int:
+        """Sender monotonic ns at which the payload's elapsed time was valid."""
+        ts_us = payload.get("timestampEpochMicros", self.state.get("timestampEpochMicros"))
+        now_mono = now_ns()
+        if isinstance(ts_us, (int, float)) and ts_us > 0:
+            age_ns = time.time_ns() - int(ts_us) * 1000
+            if -5_000_000_000 < age_ns < 3_600_000_000_000:
+                return now_mono - age_ns
+        return now_mono
 
     def _apply(self, msg: dict) -> None:
         if msg.get("type") != "data":
             return
         payload = msg.get("payload")
         diff = bool(msg.get("diff", False))
-        if payload is None:
+        if payload is None or (not diff and not payload):
+            # The adapter sends diff=false with {} when no player reports media.
             with self.lock:
                 self.state = {}
                 self.artwork_b64 = None
                 self.artwork_mime = None
-                self.received_at_ns = now_ns()
-            self.on_change({}, True)
+                self.anchor_ns = now_ns()
+                snapshot = self.message(include_artwork=False)
+            self.on_change(snapshot, True)
             return
         track_changed = False
         artwork_changed = False
         with self.lock:
             if not diff:
-                old_track = (self.state.get("bundleIdentifier"), self.state.get("title"), self.state.get("artist"), self.state.get("album"))
+                old_track = self._track_key()
                 self.state = {k: payload.get(k) for k in self.KEYS if payload.get(k) is not None}
-                if "artworkData" in payload:
-                    self.artwork_b64 = payload.get("artworkData")
-                    self.artwork_mime = payload.get("artworkMimeType")
-                    artwork_changed = True
-                new_track = (self.state.get("bundleIdentifier"), self.state.get("title"), self.state.get("artist"), self.state.get("album"))
-                track_changed = old_track != new_track
+                # A full payload is the complete state: no artwork key means no artwork (yet).
+                self.artwork_b64 = payload.get("artworkData")
+                self.artwork_mime = payload.get("artworkMimeType")
+                artwork_changed = True
+                track_changed = old_track != self._track_key()
+                self.anchor_ns = self._anchor_from(payload)
             else:
                 for k, v in payload.items():
                     if k == "artworkData":
@@ -366,28 +398,34 @@ class NowPlaying:
                         track_changed = True
                 if "artworkMimeType" in payload:
                     self.artwork_mime = payload.get("artworkMimeType")
-            self.received_at_ns = now_ns()
+                if any(k in payload for k in self.POS_KEYS):
+                    self.anchor_ns = self._anchor_from(payload)
             snapshot = self.message(include_artwork=artwork_changed)
         self.on_change(snapshot, track_changed)
 
-    def message(self, include_artwork: bool) -> dict:
-        """Build a now_playing message. Caller must hold self.lock or accept a racy snapshot."""
+    def _track_key(self):
         s = self.state
+        return (s.get("bundleIdentifier"), s.get("title"), s.get("artist"), s.get("album"))
+
+    def message(self, include_artwork: bool) -> dict:
+        """Build a now_playing message. Caller must hold self.lock."""
+        s = self.state
+        playing = bool(s.get("playing", False))
         msg = {
             "t": "now_playing",
             "app": s.get("bundleIdentifier"),
-            "playing": bool(s.get("playing", False)),
+            "playing": playing,
             "title": s.get("title"),
             "artist": s.get("artist"),
             "album": s.get("album"),
-            "duration_us": int(float(s.get("duration", 0)) * 1e6) if s.get("duration") is not None else None,
-            "elapsed_us": int(float(s.get("elapsedTime", 0)) * 1e6) if s.get("elapsedTime") is not None else None,
-            "rate": float(s.get("playbackRate", 1.0 if s.get("playing") else 0.0)),
-            "at_mac_ns": self.received_at_ns,
+            "duration_us": int(s["durationMicros"]) if s.get("durationMicros") is not None else None,
+            "elapsed_us": int(s["elapsedTimeMicros"]) if s.get("elapsedTimeMicros") is not None else None,
+            "rate": float(s.get("playbackRate", 1.0 if playing else 0.0)) if playing else 0.0,
+            "at_mac_ns": self.anchor_ns,
         }
-        if include_artwork and self.artwork_b64:
+        if include_artwork:
             msg["artwork_b64"] = self.artwork_b64
-            msg["artwork_mime"] = self.artwork_mime or "image/jpeg"
+            msg["artwork_mime"] = (self.artwork_mime or "image/jpeg") if self.artwork_b64 else None
         return msg
 
     def snapshot(self) -> dict:
@@ -395,8 +433,8 @@ class NowPlaying:
             return self.message(include_artwork=True)
 
     def command(self, op: str, pos_us: Optional[int] = None) -> Tuple[bool, str]:
-        if not self.binary:
-            return False, "media-control not installed"
+        if not self.available:
+            return False, "media-control not installed or not working on this macOS"
         if op == "seek":
             if pos_us is None:
                 return False, "seek needs pos_us"
@@ -421,11 +459,89 @@ class NowPlaying:
 
 # ----------------------------------------------------------------------------- control server
 
+class ControlConn:
+    """One control client. Other threads only enqueue; a dedicated writer thread owns sendall(),
+    so a big artwork line can never be interleaved with a time_ack, and a dead peer cannot block
+    the media-control or capture threads."""
+
+    def __init__(self, sock: socket.socket, addr, on_dead: Callable[["ControlConn"], None]):
+        self.sock = sock
+        self.addr = addr
+        self.key = "%s:%d" % addr
+        self.on_dead = on_dead
+        self.q: "queue.Queue[Optional[bytes]]" = queue.Queue(maxsize=64)
+        self.closed = False
+        threading.Thread(target=self._writer, name="control-tx-%s" % addr[0], daemon=True).start()
+
+    def send(self, msg: dict) -> bool:
+        if self.closed:
+            return False
+        data = (json.dumps(msg, separators=(",", ":")) + "\n").encode("utf-8")
+        try:
+            self.q.put_nowait(data)
+            return True
+        except queue.Full:
+            log("control client %s is not reading (64 messages queued): dropping it" % self.key)
+            self.close()
+            return False
+
+    def _writer(self) -> None:
+        try:
+            while True:
+                data = self.q.get()
+                if data is None:
+                    return
+                self.sock.sendall(data)
+        except OSError:
+            pass
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        try:
+            self.q.put_nowait(None)
+        except queue.Full:
+            pass
+        try:
+            self.sock.shutdown(socket.SHUT_RDWR)  # also wakes the reader's readline()
+        except OSError:
+            pass
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+        self.on_dead(self)
+
+
+def _configure_control_socket(sock: socket.socket) -> None:
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    if sys.platform == "darwin":
+        # Drop a peer that stops ACKing for 10 s (A105 left Wi-Fi without FIN) instead of XNU's minutes-long backoff.
+        TCP_RXT_CONNDROPTIME = 0x80
+        TCP_KEEPALIVE = 0x10
+        for opt, val in ((TCP_RXT_CONNDROPTIME, 10), (TCP_KEEPALIVE, 10)):
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, opt, val)
+            except OSError:
+                pass
+    else:
+        for name, val in (("TCP_KEEPIDLE", 10), ("TCP_KEEPINTVL", 5), ("TCP_KEEPCNT", 3)):
+            if hasattr(socket, name):
+                try:
+                    sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, name), val)
+                except OSError:
+                    pass
+
+
 class ControlServer:
     def __init__(self, port: int, sender: "Sender"):
         self.port = port
         self.sender = sender
-        self.clients: List[socket.socket] = []
+        self.clients: List[ControlConn] = []
         self.lock = threading.Lock()
         self._stop = threading.Event()
         self.last_stats: Dict[str, dict] = {}
@@ -448,38 +564,27 @@ class ControlServer:
                 continue
             except OSError:
                 break
-            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            _configure_control_socket(sock)
+            conn = ControlConn(sock, addr, self._forget)
             with self.lock:
-                self.clients.append(sock)
-            log("control client connected: %s:%d" % addr)
-            threading.Thread(target=self._client_loop, args=(sock, addr), name="control-%s" % addr[0], daemon=True).start()
+                self.clients.append(conn)
+            log("control client connected: %s" % conn.key)
+            threading.Thread(target=self._client_loop, args=(conn,), name="control-%s" % addr[0], daemon=True).start()
 
-    def _send(self, sock: socket.socket, msg: dict) -> bool:
-        data = (json.dumps(msg, separators=(",", ":")) + "\n").encode("utf-8")
-        try:
-            sock.sendall(data)
-            return True
-        except OSError:
-            return False
+    def _forget(self, conn: ControlConn) -> None:
+        with self.lock:
+            if conn in self.clients:
+                self.clients.remove(conn)
+        self.last_stats.pop(conn.key, None)
 
     def broadcast(self, msg: dict) -> None:
         with self.lock:
             clients = list(self.clients)
         for c in clients:
-            if not self._send(c, msg):
-                self._drop(c)
+            c.send(msg)
 
-    def _drop(self, sock: socket.socket) -> None:
-        with self.lock:
-            if sock in self.clients:
-                self.clients.remove(sock)
-        try:
-            sock.close()
-        except OSError:
-            pass
-
-    def _client_loop(self, sock: socket.socket, addr) -> None:
-        f = sock.makefile("r", encoding="utf-8", errors="replace")
+    def _client_loop(self, conn: ControlConn) -> None:
+        f = conn.sock.makefile("r", encoding="utf-8", errors="replace")
         try:
             for line in f:
                 line = line.strip()
@@ -489,43 +594,44 @@ class ControlServer:
                     msg = json.loads(line)
                 except ValueError:
                     continue
-                self._handle(sock, addr, msg)
-        except OSError:
+                if isinstance(msg, dict):
+                    self._handle(conn, msg)
+        except (OSError, ValueError):
             pass
         finally:
-            self._drop(sock)
-            self.last_stats.pop("%s:%d" % addr, None)
-            log("control client disconnected: %s:%d" % addr)
+            conn.close()
+            log("control client disconnected: %s" % conn.key)
 
-    def _handle(self, sock: socket.socket, addr, msg: dict) -> None:
+    def _handle(self, conn: ControlConn, msg: dict) -> None:
         t = msg.get("t")
         if t == "time":
-            self._send(sock, {"t": "time_ack", "id": msg.get("id"), "a105_ns": msg.get("a105_ns"), "mac_ns": now_ns()})
+            conn.send({"t": "time_ack", "id": msg.get("id"), "a105_ns": msg.get("a105_ns"), "mac_ns": now_ns()})
         elif t == "hello":
-            log("receiver hello from %s:%d: %s" % (addr[0], addr[1], msg.get("name", "?")))
-            self._send(sock, self.sender.source_message())
-            self._send(sock, self.sender.now_playing.snapshot())
+            log("receiver hello from %s: %s" % (conn.key, msg.get("name", "?")))
+            conn.send(self.sender.source_message())
+            conn.send(self.sender.now_playing.snapshot())
         elif t == "cmd":
             op = msg.get("op")
             pos_us = msg.get("pos_us")
             if op == "volume":
-                self._send(sock, {"t": "cmd_ack", "op": op, "ok": False, "error": "volume is handled on the A105 in this version"})
+                conn.send({"t": "cmd_ack", "op": op, "ok": False, "error": "volume is handled on the A105 in this version"})
                 return
+            self.sender.last_cmd_ns = now_ns()
 
             def run():
                 ok, err = self.sender.now_playing.command(op, pos_us)
-                log("cmd %s from %s: %s%s" % (op, addr[0], "ok" if ok else "failed", "" if ok else " (" + err + ")"))
-                self._send(sock, {"t": "cmd_ack", "op": op, "ok": ok, "error": err})
+                log("cmd %s from %s: %s%s" % (op, conn.key, "ok" if ok else "failed", "" if ok else " (" + err + ")"))
+                conn.send({"t": "cmd_ack", "op": op, "ok": ok, "error": err})
                 if ok and op in ("pause", "next", "prev", "seek"):
                     # The receiver already flushed locally; make sure audio captured before the
                     # app reacted does not get replayed on the A105.
                     self.sender.schedule_flush(delay_s=0.15)
             threading.Thread(target=run, daemon=True).start()
         elif t == "stats":
-            self.last_stats["%s:%d" % addr] = msg
+            self.last_stats[conn.key] = msg
             if self.sender.verbose:
                 log("stats %s: buffer %sms underruns %s lost %s drift %sppm rssi %s" % (
-                    addr[0], msg.get("buffer_ms"), msg.get("underruns"), msg.get("lost"), msg.get("drift_ppm"), msg.get("rssi")))
+                    conn.key, msg.get("buffer_ms"), msg.get("underruns"), msg.get("lost"), msg.get("drift_ppm"), msg.get("rssi")))
 
     def stop(self) -> None:
         self._stop.set()
@@ -536,10 +642,25 @@ class ControlServer:
         with self.lock:
             clients = list(self.clients)
         for c in clients:
-            self._drop(c)
+            c.close()
 
 
 # ----------------------------------------------------------------------------- beacon
+
+def broadcast_targets() -> List[str]:
+    """Directed broadcast of every up IPv4 interface (from ifconfig) plus the limited broadcast.
+    255.255.255.255 alone only leaves through the default-route interface (wrong NIC with a VPN,
+    Internet Sharing or Ethernet+Wi-Fi), and some Wi-Fi firmware drops it."""
+    targets = {"255.255.255.255"}
+    try:
+        out = subprocess.run(["ifconfig"], capture_output=True, text=True, timeout=2).stdout
+        targets.update(re.findall(r"\binet \d+\.\d+\.\d+\.\d+ netmask \S+ broadcast (\d+\.\d+\.\d+\.\d+)", out))
+        # Linux net-tools format: "inet 192.168.1.5  netmask 255.255.255.0  broadcast 192.168.1.255"
+        targets.update(re.findall(r"\binet \d+\.\d+\.\d+\.\d+\s+netmask \S+\s+broadcast (\d+\.\d+\.\d+\.\d+)", out))
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    return sorted(targets)
+
 
 class Beacon:
     def __init__(self, sender: "Sender", port: int, interval_s: float = 2.0):
@@ -554,15 +675,21 @@ class Beacon:
     def _loop(self) -> None:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        targets: List[str] = []
+        refreshed = -1e9
         while not self._stop.is_set():
+            if time.monotonic() - refreshed > 10:  # interfaces change (VPN up/down, hotspot)
+                targets, refreshed = broadcast_targets(), time.monotonic()
             msg = {"t": "beacon", "name": self.sender.name, "audio_port": self.sender.audio_port,
                    "control_port": self.sender.control_port, "ver": PROTOCOL_VERSION,
                    "rate": self.sender.rate, "codec": CODEC_NAMES[self.sender.codec]}
             data = json.dumps(msg, separators=(",", ":")).encode("utf-8")
-            try:
-                sock.sendto(data, ("255.255.255.255", self.port))
-            except OSError as e:
-                log("beacon send failed: %s" % e)
+            for t in targets:
+                try:
+                    sock.sendto(data, (t, self.port))
+                except OSError as e:
+                    if self.sender.verbose:
+                        log("beacon to %s failed: %s" % (t, e))
             self._stop.wait(self.interval_s)
         sock.close()
 
@@ -589,6 +716,9 @@ class Sender:
             self.rate = args.rate or SoundDeviceSource.device_default_rate(args.device)
             self.device_name = args.device
         self.block_frames = max(1, int(round(self.rate * self.block_ms / 1000.0)))
+        if self.block_frames > 65535:
+            raise ValueError("--block-ms %d at %d Hz = %d frames; the header stores frames as u16, use --block-ms <= %d"
+                             % (self.block_ms, self.rate, self.block_frames, 65535 * 1000 // self.rate))
         max_queue_blocks = max(10, int(args.max_queue_ms / self.block_ms))
         bytes_per_sec = self.rate * CHANNELS * CODEC_BYTES[self.codec]
         self.audio = AudioServer(self.audio_port, max_queue_blocks, sndbuf_bytes=bytes_per_sec // 2)
@@ -600,6 +730,8 @@ class Sender:
         self._flush_lock = threading.Lock()
         self.last_seq = 0
         self.blocks_captured = 0
+        self.silent_blocks = 0
+        self.last_cmd_ns = 0
 
     # --- capture callback (audio thread) ---
     def _on_block(self, block: np.ndarray, capture_ns: int) -> None:
@@ -610,6 +742,8 @@ class Sender:
             block = np.repeat(block, 2, axis=1)
         elif block.shape[1] > 2:
             block = block[:, :2]
+        if not block.any():
+            self.silent_blocks += 1
         payload = encode_block(block, self.codec)
         self.last_seq = self.audio.broadcast(capture_ns, self.rate, block.shape[0], self.codec, payload)
 
@@ -624,7 +758,10 @@ class Sender:
             self.control.broadcast(msg)
             if self.verbose:
                 log("now playing: %s - %s (%s)" % (msg.get("artist"), msg.get("title"), "playing" if msg.get("playing") else "paused"))
-        if track_changed and self.flush_on_track_change:
+        # Only cut the A105's buffer when the change was most likely caused by a button press there.
+        # A natural track transition on the Mac just plays out with the normal stream latency.
+        recent_cmd = now_ns() - self.last_cmd_ns < 3_000_000_000
+        if track_changed and self.flush_on_track_change and recent_cmd:
             self.schedule_flush(delay_s=0.0)
 
     def schedule_flush(self, delay_s: float) -> None:
@@ -700,22 +837,35 @@ def main(argv=None) -> int:
     if args.list_devices:
         list_devices()
         return 0
-    sender = Sender(args)
     try:
+        sender = Sender(args)
         sender.start()
     except Exception as e:  # noqa: BLE001
         log("failed to start: %s" % e)
-        if args.source == "device":
+        if isinstance(e, ImportError) or "PortAudio" in str(e):
+            log("hint: pip install -r requirements.txt (in the Python/venv you run this with)")
+        elif args.source == "device":
             log("hint: python3 walkdac_sender.py --list-devices   (is BlackHole installed and named 'BlackHole 2ch'?)")
         return 1
     try:
-        last = 0
+        last = last_cap = last_silent = 0
         while True:
             time.sleep(5)
-            sent = sender.audio.frames_sent
+            cap, silent, sent = sender.blocks_captured, sender.silent_blocks, sender.audio.frames_sent
+            stream = getattr(sender.source, "_stream", None)
+            active = None if stream is None else stream.active
+            if cap == last_cap or active is False:
+                log("WARNING: no audio blocks from %s for 5 s (stream active=%s): capture stalled. "
+                    "Restart the sender (rate changed in Audio MIDI Setup? coreaudiod restarted?)" % (sender.device_name, active))
+            elif args.source == "device" and cap > last_cap and silent - last_silent == cap - last_cap and sender.audio.client_count() > 0:
+                log("WARNING: 5 s of digital silence. Is System Settings > Sound > Output = %s, is something playing, "
+                    "and does Terminal have Microphone permission?" % sender.device_name)
             if sender.verbose or sender.audio.client_count() == 0:
-                log("clients: %d, blocks captured: %d, sent: %d (+%d)" % (sender.audio.client_count(), sender.blocks_captured, sent, sent - last))
-            last = sent
+                with sender.audio.lock:
+                    dropped = sum(c.dropped for c in sender.audio.clients)
+                log("clients: %d, blocks captured: %d, sent: %d (+%d), dropped for slow clients: %d" % (
+                    sender.audio.client_count(), cap, sent, sent - last, dropped))
+            last, last_cap, last_silent = sent, cap, silent
     except KeyboardInterrupt:
         log("stopping")
     finally:

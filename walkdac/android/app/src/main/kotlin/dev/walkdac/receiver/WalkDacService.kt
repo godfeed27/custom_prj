@@ -31,6 +31,7 @@ import dev.walkdac.core.TimeSync
 import org.json.JSONObject
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Foreground service: finds the Mac, keeps the audio and control connections alive,
@@ -57,6 +58,13 @@ class WalkDacService : Service() {
     @Volatile private var running = false
     private var managerThread: Thread? = null
     private val linkDown = AtomicBoolean(false)
+    /** Bumped by every start and stop, so a manager thread from an earlier run always exits. */
+    private val managerGen = AtomicInteger()
+    private fun alive(gen: Int) = running && gen == managerGen.get()
+    /** Guards engine/audioClient/controlClient creation and teardown across the net, manager and main threads. */
+    private val engineLock = Any()
+    /** After a `flush` from the Mac, drop audio frames whose seq is older than this (mod 2^32). -1 = none. */
+    @Volatile private var dropBeforeSeq = -1L
 
     @Volatile var status: String = "Dừng"
         private set
@@ -102,7 +110,7 @@ class WalkDacService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         startForeground(NOTIF_ID, buildNotification())
         when (intent?.action) {
-            ACTION_STOP -> { stopEverything(); stopSelf(); return START_NOT_STICKY }
+            ACTION_STOP -> { stop(); return START_NOT_STICKY }
             ACTION_TOGGLE -> command("toggle")
             ACTION_NEXT -> command("next")
             ACTION_PREV -> command("prev")
@@ -113,6 +121,7 @@ class WalkDacService : Service() {
 
     override fun onDestroy() {
         stopEverything()
+        getSystemService(NotificationManager::class.java).cancel(NOTIF_ID)
         netExecutor.shutdownNow()
         session?.release()
         session = null
@@ -123,7 +132,10 @@ class WalkDacService : Service() {
 
     fun isRunning(): Boolean = running
 
-    fun start() = startManager()
+    /** Always go through startForegroundService: a service that is only bound dies as soon as the activity unbinds. */
+    fun start() {
+        startForegroundService(Intent(this, WalkDacService::class.java).setAction(ACTION_START))
+    }
 
     fun stop() {
         stopEverything()
@@ -228,12 +240,13 @@ class WalkDacService : Service() {
     private fun startManager() {
         if (running) return
         running = true
+        val gen = managerGen.incrementAndGet()
         wakeLock?.acquire()
         wifiLock?.acquire()
         multicastLock?.acquire()
         discovery.start()
         status = "Đang tìm Mac…"
-        managerThread = Thread({ managerLoop() }, "walkdac-manager").apply { isDaemon = true; start() }
+        managerThread = Thread({ managerLoop(gen) }, "walkdac-manager").apply { isDaemon = true; start() }
         updatePlaybackState()
         updateNotification()
     }
@@ -242,6 +255,7 @@ class WalkDacService : Service() {
     private fun stopEverything() {
         if (!running) return
         running = false
+        managerGen.incrementAndGet()
         linkDown.set(true)
         teardownConnections()
         discovery.stop()
@@ -262,8 +276,8 @@ class WalkDacService : Service() {
         return Triple(b.host, b.audioPort, b.controlPort)
     }
 
-    private fun managerLoop() {
-        while (running) {
+    private fun managerLoop(gen: Int) {
+        while (alive(gen)) {
             val target = pickTarget()
             if (target == null) {
                 status = if (prefs.host.isEmpty() && !prefs.autoConnect) "Nhập IP của Mac" else "Đang tìm Mac…"
@@ -275,22 +289,22 @@ class WalkDacService : Service() {
             try {
                 status = "Đang kết nối $host"
                 val control = ControlClient(host, controlPort, ::onControlMessage) { reason -> onLinkDown("control: $reason") }
+                synchronized(engineLock) { controlClient = control }
                 control.connect()
-                controlClient = control
                 control.send(JSONObject().put("t", "hello").put("name", "NW-A105 WalkDAC").put("ver", 1))
                 val audio = AudioClient(host, audioPort, ::onFrame) { reason -> onLinkDown("audio: $reason") }
+                synchronized(engineLock) { audioClient = audio } // before connect(), so the first frames are accepted
                 audio.connect()
-                audioClient = audio
                 connectedHost = host
                 status = "Đã kết nối $host"
                 updateNotification()
-                pingLoop(control)
+                pingLoop(control, gen)
             } catch (e: Exception) {
                 status = "Lỗi: ${e.message ?: e.toString()}"
                 Log.w(TAG, "connection failed: $e")
             } finally {
-                teardownConnections()
-                if (running) {
+                if (gen == managerGen.get()) teardownConnections()
+                if (alive(gen)) {
                     reconnects++
                     SystemClock.sleep(2000)
                 }
@@ -299,10 +313,10 @@ class WalkDacService : Service() {
     }
 
     /** Sends time-sync requests (50 quick ones, then 1/s) and stats every 2 s until the link drops. */
-    private fun pingLoop(control: ControlClient) {
+    private fun pingLoop(control: ControlClient, gen: Int) {
         var n = 0
         var lastStats = 0L
-        while (running && !linkDown.get()) {
+        while (alive(gen) && !linkDown.get()) {
             val sendNs = System.nanoTime()
             val ok = control.send(JSONObject().put("t", "time").put("id", ++timeSeq).put("a105_ns", sendNs))
             if (!ok) break
@@ -338,9 +352,12 @@ class WalkDacService : Service() {
     }
 
     private fun teardownConnections() {
-        audioClient?.close(); audioClient = null
-        controlClient?.close(); controlClient = null
-        engine?.stop(); engine = null
+        synchronized(engineLock) {
+            audioClient?.close(); audioClient = null
+            controlClient?.close(); controlClient = null
+            engine?.stop(); engine = null
+            dropBeforeSeq = -1
+        }
         connectedHost = null
         timeSync.reset()
         stats.reset()
@@ -349,19 +366,37 @@ class WalkDacService : Service() {
     // ------------------------------------------------------------------ audio frames (network thread)
 
     private fun onFrame(h: FrameHeader, samples: FloatArray, n: Int, arrivalNs: Long) {
-        var e = engine
-        if (e == null || e.sampleRate != h.sampleRate) {
-            e?.stop()
-            e = AudioEngine(h.sampleRate, prefs.targetMs.toDouble())
-            try {
-                e.start()
-            } catch (ex: Exception) {
-                status = "Lỗi AudioTrack: ${ex.message}"
-                throw ex
+        val cut = dropBeforeSeq
+        if (cut >= 0) {
+            // Audio and control are separate connections: blocks captured before the cut can still arrive after `flush`.
+            if (((h.seq - cut) and 0xFFFFFFFFL) >= 0x80000000L) return
+            dropBeforeSeq = -1
+        }
+        val e = synchronized(engineLock) {
+            if (audioClient == null) return // link is being torn down
+            var e = engine
+            if (e != null && !e.alive) {
+                status = "Âm thanh lỗi (${e.lastError}), đang khởi động lại"
+                Log.w(TAG, "audio engine died: ${e.lastError}; rebuilding")
+                e.stop()
+                e = null
             }
-            engine = e
-            stats.reset()
-            status = "Đang phát ${h.sampleRate} Hz / ${h.bits}-bit"
+            if (e == null || e.sampleRate != h.sampleRate) {
+                e?.stop()
+                val fresh = AudioEngine(h.sampleRate, prefs.targetMs.toDouble())
+                try {
+                    fresh.start()
+                } catch (ex: Exception) {
+                    status = "Lỗi AudioTrack: ${ex.message}"
+                    engine = null
+                    throw ex // AudioClient closes -> link down -> reconnect in 2 s
+                }
+                engine = fresh
+                stats.reset()
+                status = "Đang phát ${h.sampleRate} Hz / ${h.bits}-bit"
+                e = fresh
+            }
+            e
         }
         e.pipeline.push(samples, 0, n)
         stats.onBlock(h.seq, h.frames, dev.walkdac.core.Protocol.HEADER_SIZE + h.payloadLen, h.captureNs, arrivalNs)
@@ -386,7 +421,6 @@ class WalkDacService : Service() {
                 updateNotification()
             }
             "now_playing" -> {
-                val old = nowPlaying
                 nowPlaying = NowPlayingInfo(
                     app = m.str("app"), playing = m.optBoolean("playing", false),
                     title = m.str("title"), artist = m.str("artist"), album = m.str("album"),
@@ -394,11 +428,9 @@ class WalkDacService : Service() {
                     elapsedUs = if (m.isNull("elapsed_us")) -1 else m.optLong("elapsed_us", -1),
                     rate = m.optDouble("rate", 0.0), atMacNs = m.optLong("at_mac_ns", 0),
                 )
-                if (m.has("artwork_b64") && !m.isNull("artwork_b64")) {
-                    artwork = decodeArtwork(m.optString("artwork_b64"))
-                } else if (old.title != nowPlaying.title || old.app != nowPlaying.app) {
-                    // keep the old artwork only while the track is the same
-                    if (old.album != nowPlaying.album) artwork = null
+                // The sender includes artwork_b64 only when the cover changed; null means "this track has no cover".
+                if (m.has("artwork_b64")) {
+                    artwork = if (m.isNull("artwork_b64")) null else decodeArtwork(m.optString("artwork_b64"))
                 }
                 updateMetadata()
                 updatePlaybackState()
@@ -409,7 +441,11 @@ class WalkDacService : Service() {
                 val macNs = m.optLong("mac_ns", -1)
                 if (sendNs > 0 && macNs > 0) timeSync.add(sendNs, System.nanoTime(), macNs)
             }
-            "flush" -> engine?.flush()
+            "flush" -> {
+                val from = m.optLong("from_seq", -1)
+                if (from >= 0) dropBeforeSeq = from and 0xFFFFFFFFL
+                engine?.flush()
+            }
             "cmd_ack" -> {
                 val op = m.optString("op")
                 lastCommand = if (m.optBoolean("ok")) "$op → OK" else "$op → lỗi: ${m.str("error")}"

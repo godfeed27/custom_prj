@@ -30,7 +30,11 @@ class PlaybackPipeline(
 
     var targetMs: Double
         get() = drift.targetMs
-        set(value) { drift.targetMs = value.coerceIn(minPlayMs + blockMs, 10000.0) }
+        set(value) {
+            drift.targetMs = value.coerceIn(minPlayMs + blockMs, 10000.0)
+            retargetRequested = true
+        }
+    @Volatile private var retargetRequested = false
 
     @Volatile var state: State = State.PREBUFFER
         private set
@@ -67,10 +71,31 @@ class PlaybackPipeline(
         blocksOut++
         var fill = buffer.fillMs(sampleRate)
         if (state == State.PREBUFFER) {
+            retargetRequested = false
             if (fill < drift.targetMs) return silence(out)
+            // A Wi-Fi stall delivers its backlog in one burst: start at the target instead of
+            // leaving the extra latency for the ±500 ppm loop to remove over many minutes.
+            val excess = ((fill - drift.targetMs) * sampleRate / 1000.0).toInt() - blockFrames
+            if (excess > 0) {
+                droppedFrames += buffer.skip(excess)
+                hardResyncs++
+                fill = buffer.fillMs(sampleRate)
+            }
             state = State.PLAYING
             drift.reset()
             adjuster.reset()
+        }
+        if (retargetRequested) {
+            retargetRequested = false
+            val diff = fill - drift.targetMs
+            if (diff > 2 * blockMs + 50.0) { // lowered a lot: one cut now
+                droppedFrames += buffer.skip((diff * sampleRate / 1000.0).toInt())
+                drift.reset(); adjuster.reset()
+                fill = buffer.fillMs(sampleRate)
+            } else if (diff < -(2 * blockMs + 50.0)) { // raised a lot: refill behind a short silence
+                state = State.PREBUFFER
+                return silence(out)
+            }
         }
         if (fill < minPlayMs) {
             underruns++
@@ -90,6 +115,11 @@ class PlaybackPipeline(
         if (d > maxDelta) d = maxDelta
         if (d < -blockFrames / 2) d = -blockFrames / 2
         val avail = buffer.availableFrames
+        if (avail < blockFrames / 2) {
+            // flush() from another thread emptied the buffer after fillMs() was read
+            state = State.PREBUFFER
+            return silence(out)
+        }
         if (blockFrames + d > avail) d = avail - blockFrames
         val need = blockFrames + d
         val got = buffer.read(scratch, 0, need)

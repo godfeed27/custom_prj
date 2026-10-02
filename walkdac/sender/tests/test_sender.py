@@ -171,7 +171,77 @@ class LoopbackTests(unittest.TestCase):
         self.assertTrue(gap_seen, "after a stall the receiver should see a seq gap (dropped blocks), not an unbounded backlog")
 
 
+class NowPlayingTests(unittest.TestCase):
+    def setUp(self):
+        self.events = []
+        self.np = ws.NowPlaying(enabled=False, on_change=lambda m, changed: self.events.append((m, changed)))
+
+    def test_full_then_artwork_diff_keeps_anchor(self):
+        ts = int(time.time() * 1e6) - 2_000_000  # elapsed time was valid 2 s ago
+        self.np._apply({"type": "data", "diff": False, "payload": {
+            "bundleIdentifier": "com.spotify.client", "playing": True, "title": "A", "artist": "X",
+            "durationMicros": 200_000_000, "elapsedTimeMicros": 10_000_000, "timestampEpochMicros": ts, "playbackRate": 1}})
+        m1, changed1 = self.events[-1]
+        self.assertTrue(changed1)
+        self.assertEqual(m1["elapsed_us"], 10_000_000)
+        self.assertEqual(m1["duration_us"], 200_000_000)
+        self.assertIsNone(m1["artwork_b64"])
+        age_ms = (ws.now_ns() - m1["at_mac_ns"]) / 1e6
+        self.assertAlmostEqual(age_ms, 2000, delta=150)
+        time.sleep(0.3)
+        self.np._apply({"type": "data", "diff": True, "payload": {"artworkData": "QUJD", "artworkMimeType": "image/png"}})
+        m2, changed2 = self.events[-1]
+        self.assertFalse(changed2)
+        self.assertEqual(m2["artwork_b64"], "QUJD")
+        self.assertEqual(m2["artwork_mime"], "image/png")
+        self.assertEqual(m2["at_mac_ns"], m1["at_mac_ns"], "artwork-only diff must not move the timeline anchor")
+        self.assertEqual(m2["title"], "A")
+
+    def test_new_track_without_artwork_clears_old_cover_and_empty_payload_clears_all(self):
+        self.np._apply({"type": "data", "diff": False, "payload": {"title": "A", "artworkData": "QUJD", "playing": True}})
+        self.np._apply({"type": "data", "diff": False, "payload": {"title": "B", "playing": True}})
+        m, changed = self.events[-1]
+        self.assertTrue(changed)
+        self.assertIsNone(m["artwork_b64"])
+        self.np._apply({"type": "data", "diff": False, "payload": {}})
+        m, changed = self.events[-1]
+        self.assertTrue(changed)
+        self.assertIsNone(m["title"])
+        self.assertFalse(m["playing"])
+        self.assertEqual(m["rate"], 0.0)
+
+
+class ControlConnTests(unittest.TestCase):
+    def test_large_line_is_never_interleaved(self):
+        a, b = socket.socketpair()
+        a.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 8192)
+        b.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8192)
+        dead = []
+        conn = ws.ControlConn(a, ("127.0.0.1", 1), dead.append)
+        big = {"t": "now_playing", "artwork_b64": "A" * 600_000}
+        senders = [threading.Thread(target=conn.send, args=(big,))] + \
+                  [threading.Thread(target=conn.send, args=({"t": "time_ack", "id": i},)) for i in range(20)]
+        for th in senders:
+            th.start()
+        f = b.makefile("r", encoding="utf-8")
+        lines = [json.loads(f.readline()) for _ in range(21)]  # every line must parse
+        self.assertEqual(sum(1 for m in lines if m["t"] == "now_playing"), 1)
+        self.assertEqual(sum(1 for m in lines if m["t"] == "time_ack"), 20)
+        conn.close()
+        b.close()
+        self.assertEqual(dead, [conn])
+
+
 class BeaconTests(unittest.TestCase):
+    def test_broadcast_targets_include_limited(self):
+        self.assertIn("255.255.255.255", ws.broadcast_targets())
+
+    def test_block_size_is_bounded(self):
+        args = ws.build_parser().parse_args(["--source", "sine", "--rate", "96000", "--block-ms", "1000",
+                                             "--port", "0", "--control-port", "0", "--no-beacon", "--no-media-control"])
+        with self.assertRaises(ValueError):
+            ws.Sender(args)
+
     def test_beacon_broadcast(self):
         rx = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         rx.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
