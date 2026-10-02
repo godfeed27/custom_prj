@@ -32,6 +32,7 @@ import java.util.Locale
 class MainActivity : Activity() {
 
     private var service: WalkDacService? = null
+    private var bound = false
     private val handler = Handler(Looper.getMainLooper())
     private lateinit var prefs: Prefs
 
@@ -72,13 +73,14 @@ class MainActivity : Activity() {
 
     override fun onStart() {
         super.onStart()
-        bindService(Intent(this, WalkDacService::class.java), connection, Context.BIND_AUTO_CREATE)
+        bound = bindService(Intent(this, WalkDacService::class.java), connection, Context.BIND_AUTO_CREATE)
         handler.post(tick)
     }
 
     override fun onStop() {
         handler.removeCallbacks(tick)
-        if (service != null) unbindService(connection)
+        if (bound) unbindService(connection)
+        bound = false
         service = null
         super.onStop()
     }

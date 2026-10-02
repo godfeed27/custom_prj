@@ -29,6 +29,7 @@ import dev.walkdac.core.FrameHeader
 import dev.walkdac.core.StreamStats
 import dev.walkdac.core.TimeSync
 import org.json.JSONObject
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -42,6 +43,8 @@ class WalkDacService : Service() {
     }
 
     private val binder = LocalBinder()
+    /** All outgoing control writes happen here: callers are often on the main thread, where sockets are forbidden. */
+    private val netExecutor = Executors.newSingleThreadExecutor { r -> Thread(r, "walkdac-control-tx").apply { isDaemon = true } }
     lateinit var prefs: Prefs
         private set
     val discovery = Discovery()
@@ -110,6 +113,7 @@ class WalkDacService : Service() {
 
     override fun onDestroy() {
         stopEverything()
+        netExecutor.shutdownNow()
         session?.release()
         session = null
         super.onDestroy()
@@ -140,23 +144,24 @@ class WalkDacService : Service() {
 
     fun reconnectNow() { linkDown.set(true) }
 
-    /** play | pause | toggle | next | prev | seek */
+    /** play | pause | toggle | next | prev | seek. Safe to call from any thread (UI, MediaSession callback). */
     fun command(op: String, posUs: Long = -1) {
-        val c = controlClient
         if (op == "pause" || op == "next" || op == "prev" || op == "seek") engine?.flush()
         val msg = JSONObject().put("t", "cmd").put("op", op)
         if (op == "seek") msg.put("pos_us", posUs)
-        val sent = c?.send(msg) ?: false
-        lastCommand = if (sent) "$op → đã gửi" else "$op → chưa kết nối"
-        if (sent) {
-            val np = nowPlaying
-            nowPlaying = when (op) {
-                "play" -> np.copy(playing = true)
-                "pause" -> np.copy(playing = false)
-                "toggle" -> np.copy(playing = !np.playing)
-                else -> np
+        netExecutor.execute {
+            val sent = controlClient?.send(msg) ?: false
+            lastCommand = if (sent) "$op → đã gửi" else "$op → chưa kết nối"
+            if (sent) {
+                val np = nowPlaying
+                nowPlaying = when (op) {
+                    "play" -> np.copy(playing = true)
+                    "pause" -> np.copy(playing = false)
+                    "toggle" -> np.copy(playing = !np.playing)
+                    else -> np
+                }
+                updatePlaybackState()
             }
-            updatePlaybackState()
         }
     }
 
@@ -229,6 +234,7 @@ class WalkDacService : Service() {
         discovery.start()
         status = "Đang tìm Mac…"
         managerThread = Thread({ managerLoop() }, "walkdac-manager").apply { isDaemon = true; start() }
+        updatePlaybackState()
         updateNotification()
     }
 
@@ -365,12 +371,15 @@ class WalkDacService : Service() {
 
     // ------------------------------------------------------------------ control messages (control thread)
 
+    /** org.json returns the string "null" for JSON null from optString; we want "". */
+    private fun JSONObject.str(key: String): String = if (isNull(key)) "" else optString(key, "")
+
     private fun onControlMessage(m: JSONObject) {
         when (m.optString("t")) {
             "source" -> {
                 source = SourceInfo(
-                    name = m.optString("name"), device = m.optString("device"), capture = m.optString("capture"),
-                    rate = m.optInt("rate"), codec = m.optString("codec"), bits = m.optInt("bits"),
+                    name = m.str("name"), device = m.str("device"), capture = m.str("capture"),
+                    rate = m.optInt("rate"), codec = m.str("codec"), bits = m.optInt("bits"),
                     channels = m.optInt("channels", 2), blockMs = m.optInt("block_ms"),
                     mediaControl = m.optBoolean("media_control", false),
                 )
@@ -379,8 +388,8 @@ class WalkDacService : Service() {
             "now_playing" -> {
                 val old = nowPlaying
                 nowPlaying = NowPlayingInfo(
-                    app = m.optString("app"), playing = m.optBoolean("playing", false),
-                    title = m.optString("title"), artist = m.optString("artist"), album = m.optString("album"),
+                    app = m.str("app"), playing = m.optBoolean("playing", false),
+                    title = m.str("title"), artist = m.str("artist"), album = m.str("album"),
                     durationUs = if (m.isNull("duration_us")) -1 else m.optLong("duration_us", -1),
                     elapsedUs = if (m.isNull("elapsed_us")) -1 else m.optLong("elapsed_us", -1),
                     rate = m.optDouble("rate", 0.0), atMacNs = m.optLong("at_mac_ns", 0),
@@ -403,7 +412,7 @@ class WalkDacService : Service() {
             "flush" -> engine?.flush()
             "cmd_ack" -> {
                 val op = m.optString("op")
-                lastCommand = if (m.optBoolean("ok")) "$op → OK" else "$op → lỗi: ${m.optString("error")}"
+                lastCommand = if (m.optBoolean("ok")) "$op → OK" else "$op → lỗi: ${m.str("error")}"
             }
         }
     }
