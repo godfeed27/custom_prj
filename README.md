@@ -245,3 +245,123 @@ Nguồn thêm cho mục này:
 [sherpa‑onnx TTS engine APK](https://k2-fsa.github.io/sherpa/onnx/tts/apk-engine.html),
 [Piper + sherpa‑onnx trên thiết bị](https://medium.com/@patare.vivek/running-neural-text-to-speech-on-device-with-piper-and-sherpa-onnx-58f4eed29247),
 [Termux PulseAudio OpenSL ES sink](https://github.com/termux/termux-packages/pull/6290).
+
+---
+
+## 8. Hardcore: bản đồ phần cứng từ device tree và các project đỉnh
+
+Mục này dựa trên **kernel source GPL của Sony** trong repo cộng đồng
+(`kernel_imx/arch/arm64/boot/dts/sony/sony-imx8mm-dmp1.dts`, các overlay `icx1293`/`icx1295`,
+và `kernel_imx/walkman.config`). Đây là bằng chứng trực tiếp về những gì bo mạch có, không phải suy đoán từ marketing.
+
+### 8.1 Bo mạch thật sự có gì (từ DTS + kernel config)
+
+| Khối | Linh kiện / cấu hình trong DTS | Ý nghĩa cho project |
+|---|---|---|
+| Board ID | `ICX1293` = dòng A100 (pin 1285 mAh), `ICX1295` = dòng ZX500 (pin 1500 mAh, có thêm FPGA Lattice LIF‑MD6000 "RME" = DSD Remastering Engine). Cả hai dùng chung `sony-imx8mm-dmp1.dts` | A105 của bạn là ICX1293. Phần mềm A100 và ZX500 gần như giống nhau, chỉ khác overlay |
+| USB‑C | `usbotg1` với `dr_mode = "otg"`, Type‑C controller **FUSB303D** (`port-role = "drp-try.snk"`, cấp 500 mA), VBUS 5 V lấy từ **boost của sạc BQ25898** qua chân `OTG_EN` (GPIO4_IO19). Kernel bật `USB_CHIPIDEA_HOST`, `USB_STORAGE`, `SND_USB_AUDIO`, `USB_HID` | **USB host (OTG) được thiết kế sẵn trong phần cứng lẫn kernel.** Flash drive, DAC USB, bàn phím USB‑C có cơ sở để chạy. Nếu Android không nhận là do vendor config, không phải do phần cứng |
+| USB gadget | `USB_CONFIGFS=y`, `USB_F_UAC2=m` (có module UAC2 nhưng Sony không bật `USB_CONFIGFS_F_UAC2`), có MTP/ADB/RNDIS/NCM/MIDI/HID | **USB DAC mode (Sony đã bỏ) có thể phục hồi bằng kernel tự build** |
+| microSD | `usdhc2`, card‑detect qua GPIO5_IO3 (A100: active‑low), có các trạng thái pinctrl `cd_pullup/pulldown/none`, thuộc tính Sony `svs,icx-cd-gpios`, `svs,icx-cd-wake` | **Nếu chỉ hỏng công tắc card‑detect**, sửa được bằng DTS (`broken-cd`), xem 8.3 |
+| eMMC | `usdhc3`, 8‑bit, HS400, bảng drive‑strength cho Toshiba / Hynix / Samsung | eMMC chuẩn BGA; thay eMMC lớn hơn là khả thi về nguyên tắc (8.6) |
+| Âm thanh | Codec **CXD3778GF** (S‑Master HX) trên I2C 0x4e, nhận dữ liệu qua **SAI3** với hai pinctrl `hi_res` và `dsd` (`fsl,sai-multi-lane`, DSD dataline), hai thạch anh 44.1k/48k riêng (`osc_fs441_en`, `osc_fs480_en`), GPIO mute SE/BTL, nguồn BTL 5 V/7 V; SAI5 "guidance"; MICFIL (PDM mic in) | Driver ASoC **có source** (`sound/soc/codecs/cxd3778gf/`: `_table.c` bảng tuning, `_dnc.c` chống ồn, `_regmon.c` theo dõi thanh ghi). Đây là chìa khoá cho mod âm thanh và port mainline |
+| Lõi M4 | `m4_reserved` RAM tại 0x80000000, `&mu` + `&rpmsg` bật, node `sony,imx8mm-rpmsg-i2s` ("audio device in M4 domain"), `CONFIG_ICX_SILENT_LPA_LOG` | **Cortex‑M4 đang chạy firmware Low‑Power Audio của Sony**: A53 ngủ, M4 bơm PCM ra SAI. Đó là lý do pin 26 giờ. Có thể thay bằng firmware tự viết (8.5) |
+| MCU phụ | NXP **Kinetis MKL17Z32** (Cortex‑M0+) trên I2C 0x10, có chân `ucon_xfwupdate`, `ucon_req`, `ucon_xreset` | Vi điều khiển "ucon" của Sony, cập nhật firmware được từ A53. Chức năng chưa rõ (nghi quản lý nguồn/jack/DNC) – mục tiêu RE |
+| NFC | **NXP PN7150** (NCI controller đầy đủ) trên I2C 0x28 | Không phải tag thụ động: đọc/ghi thẻ NFC được nếu có stack (Android NFC hoặc Linux `nxp-nci` + neard) |
+| Wi‑Fi / BT | Wi‑Fi SDIO `brcmfmac` trên `usdhc1` (chân `WLAN_EN`), BT qua `uart1` HCI‑UART Broadcom | Module Broadcom/Cypress, mainline hỗ trợ tốt |
+| UART console | `uart2` là `stdout-path` (console u‑boot/kernel) | **Có cổng debug trên PCB**, chỉ cần tìm test‑pad |
+| Màn hình / cảm ứng | Panel MIPI‑DSI **Himax HX83102D** 720×1280 (40×67 mm) qua LCDIF + NWL DSI, backlight PWM; cảm ứng Himax (`himax,hxcommon`) qua **SPI** | Mainline có `panel-himax-hx83102` (cần thêm chuỗi init từ driver Sony) |
+| Nguồn | PMIC ROHM **BD71837/BD71840**, sạc **BQ25898** (driver Sony `bq25898-icx`), đo pin **MAX1704x** (bảng model pin trong DTS), 2 vị trí gia tốc kế **BMA422** | PMIC + gauge có driver mainline; BQ25898 chưa có (ID khác bq25890), FUSB303 chưa có |
+| Nút cứng | `gpio-keys`: play, vol±, ff, fr đều `wakeup-source`; `sony,hold_switch` | Mainline dùng lại được ngay |
+| Thừa từ EVK | camera OV5640, FlexSPI NOR (disabled), `gps_ctl`/uart3, PCIe pinctrl | Không có trên máy, bỏ qua |
+
+### 8.2 Năm project hardcore, xếp theo "lời / công"
+
+| # | Project | Lời được gì | Việc phải làm | Rủi ro |
+|---|---|---|---|---|
+| H1 | **USB DAC mode bằng kernel** (gadget UAC2) | Walkman thành card âm thanh USB cho PC/điện thoại: PC → USB‑C → S‑Master HX → tai nghe. Tính năng Sony đã bỏ | Build kernel với `CONFIG_USB_CONFIGFS_F_UAC2=y`; tạo function `uac2.0` trong configfs cạnh `mtp`/`ffs`; viết daemon nhỏ (tinyalsa) đọc PCM từ gadget và đẩy vào AudioFlinger (hoặc Termux `arecord | pacat`) để vẫn đi qua DSEE/EQ | Thấp: chỉ kernel + userland, hoàn tác bằng flash lại boot |
+| H2 | **Bluetooth receiver (A2DP sink)** | Điện thoại phát BT → Walkman → ampli/tai nghe. Tính năng thứ hai Sony đã bỏ | Trên Android 9: overlay `profile_supported_a2dp_sink=true` vào `/vendor/overlay` + route "A2DP In" trong audio policy của Sony. 50/50 vì HAL của Sony có thể không có đường vào này. Trên Linux (H4): BlueZ + PipeWire làm sẵn | Trung bình |
+| H3 | **"Walkman One" cho A100** – mod bảng tuning CXD3778GF | Đổi chất âm ở tầng driver, giống các mod nổi tiếng của dòng WM1A/ZX300 (cùng họ codec). Chưa ai làm cho Android Walkman | Đọc `cxd3778gf_table.c`, `cxd3778gf_register.c`; dùng `cxd3778gf_regmon` để xem thanh ghi lúc chạy; thử bảng của ICX1295 (ZX500) trên ICX1293 cho đường SE; build kernel | Trung bình: sai bảng có thể tắt tiếng, không hỏng phần cứng |
+| H4 | **Mainline Linux / postmarketOS** | Hệ điều hành của riêng bạn: MPD + librespot + shairport‑sync + snapclient + BlueZ A2DP sink + UAC2 gadget + NFC tap‑to‑play. Mọi thứ Sony bỏ đều có trên Linux | Xem lộ trình 8.4 | Cao về thời gian, thấp về brick (giữ u‑boot Sony, dùng slot B) |
+| H5 | **Firmware M4 tự viết** | Low‑Power Audio của riêng bạn (ví dụ decode FLAC trên M4 để A53 ngủ lâu hơn), hoặc M4 làm việc khác khi chạy Linux | SDK MCUXpresso `evkmimx8mm/demo_apps/sai_low_power_audio` là mã nguồn mở của chính cơ chế Sony dùng; cần nạp qua `imx_rproc` (mainline) hoặc u‑boot `bootaux` | Cao: chỉ hợp lý sau H4 |
+
+### 8.3 Cứu khe microSD bằng phần mềm (thử trước khi khò)
+
+Khe thẻ "hỏng" thường là một trong ba trường hợp: (a) cơ cấu push‑push gãy nhưng chân tiếp xúc còn,
+(b) công tắc card‑detect gãy/cong, (c) chân data gãy. Chỉ (c) bắt buộc thay socket.
+
+```
+# cần root (KernelSU/APatch). GPIO5_IO3 = số 131 trong sysfs/debugfs
+adb shell su -c "cat /sys/kernel/debug/gpio | grep -n 'gpio-131'"
+# cắm thẻ, giữ tay cho thẻ nằm đúng vị trí, chạy lại lệnh: giá trị phải đổi lo/hi
+adb shell su -c "dmesg | grep -iE 'mmc1|usdhc2|sd card'"
+```
+
+- Giá trị đổi và `dmesg` thấy `mmc1: new ... SDXC card` → chỉ hỏng cơ cấu giữ thẻ: dán cố định thẻ, xong.
+- Giá trị không đổi nhưng thẻ còn tốt → hỏng công tắc detect: sửa DTS. Bung `dtbo_a100.img` bằng
+  `dtc`, trong node `usdhc2` thêm `broken-cd;` (kernel sẽ poll thẻ thay vì chờ công tắc) và bỏ
+  `svs,icx-cd-gpios`, biên dịch lại, `fastboot flash dtbo_a dtbo.img`. Đồng thời dán cố định thẻ.
+- `dmesg` báo CRC/timeout → chân data hỏng, phải thay socket (8.6).
+
+### 8.4 Lộ trình port mainline Linux (postmarketOS) cho ICX1293
+
+1. **An toàn trước**: root, dump toàn bộ phân vùng (`dd` từng `/dev/block/by-name/*` sang PC, đặc biệt
+   `nvp`, `boot`, `vbmeta`, `dtbo`, `vendor`). Kiểm tra HAB (secure boot) đã đóng chưa:
+   ```
+   # bank 1 word 3 bit 25 = SEC_CONFIG[1] trên i.MX 8M Mini
+   adb shell su -c "dd if=/sys/bus/nvmem/devices/imx-ocotp0/nvmem bs=4 skip=7 count=1 2>/dev/null | xxd"
+   ```
+   HAB đóng → **không bao giờ** động vào u‑boot/SPL của Sony; chỉ thay boot image (u‑boot Sony vẫn
+   nạp kernel bất kỳ sau `oem unlock`, đã chứng minh bằng kernel KernelSU).
+2. **UART**: tìm test‑pad của `uart2` trên PCB (3 chân TX/RX/GND, thử mức 1.8 V trước), lấy log u‑boot.
+   Không bắt buộc nhưng rút ngắn mọi bước sau rất nhiều.
+3. **Dual‑boot bằng A/B**: giữ Android ở slot A, flash kernel mainline vào `boot_b`,
+   `fastboot --set-active=b`. Rootfs đặt trên USB flash qua OTG (H1 đã chứng minh host mode) hoặc
+   trên `userdata`. Hỏng thì `--set-active=a` quay lại Android.
+4. **Bring‑up theo thứ tự**: SoC + PMIC BD71837 + eMMC + UART (có sẵn trong `imx8mm-evk.dts`, copy
+   sang `imx8mm-sony-icx1293.dts`) → nút bấm `gpio-keys` → Wi‑Fi `brcmfmac` (cần firmware/NVRAM từ
+   `/vendor/firmware`) → BT HCI‑UART → panel HX83102D (thêm chuỗi init lấy từ driver Sony vào
+   `panel-himax-hx83102`) → cảm ứng Himax SPI (port driver Sony) → sạc/gauge (port `bq25898-icx`,
+   MAX1704x có sẵn) → Type‑C (port `fusb303d` của Sony, mainline chưa có) → **codec CXD3778GF**
+   (port ASoC driver Sony, việc lớn nhất) → GPU etnaviv, VPU hantro → NFC `nxp-nci` → M4 `imx_rproc`.
+5. **Payload**: Alpine/pmOS + PipeWire + MPD/mpd‑web, librespot (Spotify Connect), shairport‑sync
+   (AirPlay), snapclient, BlueZ (A2DP sink), gadget UAC2, neard (NFC). Giao diện: Sxmo, hoặc app
+   LVGL/Flutter toàn màn hình cho 3.6".
+
+### 8.5 Lõi M4: Sony dùng để làm gì và bạn làm được gì
+
+Theo DTS, A53 gửi PCM vào vùng RAM dành riêng (`fsl,dma-buffer-size` 96 MB) và M4 bơm ra SAI qua RPMsg
+("Low‑Power Audio"). Đây đúng là thiết kế tham chiếu NXP (AN12195 / `sai_low_power_audio`), nên
+mã nguồn gốc của cơ chế này là mở. Hướng đi:
+
+- Dump firmware M4 từ gói firmware đã bung (tìm blob không phải ARM64, thường nằm trong `vendor/firmware`
+  hoặc một phân vùng riêng mà u‑boot `bootaux`), mở bằng Ghidra để xem Sony có thêm gì (DSD? lệnh riêng?).
+- Viết firmware mới từ SDK: thêm decode FLAC/MP3 trên M4 để A53 ngủ cả khi nghe lossless, hoặc
+  dùng M4 làm bộ điều khiển nút/LED/BLE khi chạy Linux.
+- Chỉ làm trong bối cảnh H4: driver `sony,imx8mm-rpmsg-i2s` của Android gắn chặt với giao thức của Sony.
+
+### 8.6 Hardcore phần cứng
+
+| Việc | Khả thi | Ghi chú |
+|---|---|---|
+| Thay socket microSD | Có, tiệm khò làm được | Chỉ khi 8.3 kết luận chân data hỏng. Chụp ảnh PCB trước khi tháo |
+| Thay eMMC 16 GB → 128/256 GB | Có nguyên tắc, rất khó | Phải dump đủ phân vùng trước (nhất là `nvp` chứa khoá thiết bị và mã vùng); reball BGA‑153; nạp lại bằng `uuu` qua chế độ Serial Download của ROM i.MX (eMMC trống → ROM tự rơi vào SDP). Chỉ nạp lại đúng ảnh u‑boot/SPL đã dump để không vướng HAB |
+| Thêm jack 4.4 mm balanced | Không | Codec hỗ trợ BTL nhưng PCB A100 không có tầng ra BTL và nguồn 5 V/7 V cho nó |
+| Hàn dây UART | Có, dễ | Bước đầu của mọi việc ở 8.4 |
+| Đổi pin lớn hơn | Có | Phải cập nhật bảng model pin MAX1704x trong DTS (`full_battery_capacity`, `model_data`) nếu không gauge báo sai |
+
+### 8.7 Bắt đầu từ đâu nếu chọn hardcore
+
+1. Root + dump phân vùng + kiểm tra HAB (một buổi tối).
+2. Chẩn đoán khe thẻ theo 8.3 (một giờ). Có thể giải quyết luôn vấn đề gốc.
+3. Thử OTG với flash drive và DAC USB (mười phút) để xác nhận host mode.
+4. H1 USB DAC mode (một cuối tuần): kernel + configfs + daemon.
+5. H3 mod tuning codec (vài cuối tuần, phụ thuộc đọc hiểu driver).
+6. H4 mainline Linux (vài tháng, làm dần theo 8.4). Khi codec chạy được trên mainline, mọi thứ còn lại là phần mềm Linux thông thường.
+
+Nguồn: DTS và config trong [97lily/2019_android_walkman](https://github.com/97lily/2019_android_walkman)
+(`kernel_imx/arch/arm64/boot/dts/sony/`, `kernel_imx/walkman.config`, `kernel_imx/sound/soc/codecs/cxd3778gf/`),
+[NXP AN12195 Low‑Power Audio on i.MX8M](https://www.nxp.com/docs/en/application-note/AN12195.pdf),
+[NXP M4 Low Power Demo trên i.MX8MM](https://community.nxp.com/t5/i-MX-Processors-Knowledge-Base/M4-Low-Power-Demo-on-i-MX8MM/ta-p/1101109),
+[panel-himax-hx83102 mainline](https://codebrowser.dev/linux/linux/drivers/gpu/drm/panel/panel-himax-hx83102.c.html),
+[bq25890_charger mainline và giới hạn với BQ25898](https://e2e.ti.com/support/power-management-group/power-management/f/power-management-forum/589850/linux-bq25898d-bq25898d),
+[FUSB303 datasheet](https://www.onsemi.com/download/data-sheet/pdf/fusb303b-d.pdf).
